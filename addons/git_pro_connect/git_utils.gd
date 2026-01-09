@@ -2,10 +2,10 @@
 extends RefCounted
 class_name GitUtils
 
-# ЭТИ ПАПКИ ИГНОРИРУЮТСЯ ВСЕГДА
-const HARD_IGNORE_DIRS = [".git", ".godot", ".import", "android", "ios", "build", "cmake-build-debug"]
+# ЭТИ ПАПКИ ИГНОРИРУЮТСЯ ВСЕГДА (Жесткая защита от зависаний)
+const HARD_IGNORE_DIRS = [".git", ".godot", ".import", "android", "ios", "build", "cmake-build-debug", "node_modules"]
 
-# Стандартный шаблон (добавлен *.uid)
+# Стандартный шаблон .gitignore
 const DEFAULT_TEXT = """# Godot
 .godot/
 .import/
@@ -32,6 +32,7 @@ func load_gitignore(path: String = "res://.gitignore"):
 	simple_extensions.clear()
 	path_rules.clear()
 	
+	# Если файла нет, используем дефолтные правила в памяти
 	if not FileAccess.file_exists(path):
 		_parse_rules(DEFAULT_TEXT.split("\n"))
 		return
@@ -46,21 +47,25 @@ func _parse_rules(lines):
 		line = line.strip_edges()
 		if line == "" or line.begins_with("#"): continue
 		
+		# Оптимизация для расширений (*.png)
 		if line.begins_with("*.") and not "/" in line:
 			simple_extensions.append(line.replace("*.", ""))
 		else:
 			path_rules.append(line)
 
 func is_ignored(path: String) -> bool:
+	# path приходит как "res://folder/file.gd"
 	var rel_path = path.replace("res://", "")
 	var file_name = rel_path.get_file()
 	
-	# БЫСТРАЯ ПРОВЕРКА UID ТУТ ТОЖЕ
+	# 1. Быстрая проверка UID (критично для Godot 4)
 	if file_name.ends_with(".uid"): return true
 	
+	# 2. Проверка по расширению
 	var ext = file_name.get_extension()
 	if ext in simple_extensions: return true
 	
+	# 3. Сложные правила путей
 	for rule in path_rules:
 		if rule.ends_with("/"):
 			if rel_path.begins_with(rule) or rel_path.begins_with(rule.trim_suffix("/")):
