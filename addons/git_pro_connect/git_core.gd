@@ -62,11 +62,11 @@ func smart_sync(local_files: Array, message: String):
 	if not remote_head: _finish(false, "Нет связи с GitHub."); return
 
 	if last_known_sha != "" and remote_head != last_known_sha:
-		_log("Скачивание изменений с сервера...", Color.AQUA)
+		_log("Скачивание изменений...", Color.AQUA)
 		var pull_ok = await _do_pull(remote_head)
 		if not pull_ok: return 
 	
-	await _do_push(remote_head, local_files, message)
+	await _do_push_optimized(remote_head, local_files, message)
 
 func _do_pull(head_sha) -> bool:
 	var tree_sha = await _get_commit_tree(head_sha)
@@ -93,40 +93,77 @@ func _do_pull(head_sha) -> bool:
 	EditorInterface.get_resource_filesystem().scan()
 	return true
 
-func _do_push(base_sha, local_files_paths: Array, message: String):
-	_log("Подготовка...", Color.YELLOW)
-	var blobs_input = []
-	for p in local_files_paths: blobs_input.append({"path": p})
-	
-	var uploaded_blobs = []
-	if not blobs_input.is_empty():
-		uploaded_blobs = await _start_queue(blobs_input, true)
-		if uploaded_blobs.size() != blobs_input.size(): _finish(false, "Ошибка загрузки."); return
+func _do_push_optimized(base_sha, local_files_paths: Array, message: String):
+	_log("Анализ файлов (Hashing)...", Color.YELLOW)
 	
 	var old_tree_sha = await _get_commit_tree(base_sha)
 	var old_remote_files = await _get_tree_recursive(old_tree_sha)
 	
-	var final_tree = []
-	var processed_paths = {}
-	for b in uploaded_blobs: final_tree.append(b); processed_paths[b["path"]] = true
+	var remote_sha_map = {}
+	var remote_path_map = {}
 	
+	for r in old_remote_files:
+		if r["type"] == "blob":
+			remote_sha_map[r["sha"]] = true
+			remote_path_map[r["path"]] = r["sha"]
+	
+	var files_to_upload = []
+	var final_tree_items = []
+	var processed_local_paths = {}
+	var auto_msg_files = []
+	var count = 0
+	
+	emit_signal("progress", "Хеширование", 0, local_files_paths.size())
+	
+	for path in local_files_paths:
+		count += 1
+		if count % 10 == 0: 
+			emit_signal("progress", "Хеширование", count, local_files_paths.size())
+			await get_tree().process_frame
+			
+		var local_sha = _calculate_git_sha(path)
+		var rel_path = path.replace("res://", "")
+		processed_local_paths[rel_path] = true
+		
+		if remote_sha_map.has(local_sha):
+			final_tree_items.append({ "path": rel_path, "mode": "100644", "type": "blob", "sha": local_sha })
+			if remote_path_map.get(rel_path) != local_sha: auto_msg_files.append(rel_path.get_file())
+		else:
+			files_to_upload.append({"path": path})
+			auto_msg_files.append(rel_path.get_file())
+	
+	if not files_to_upload.is_empty():
+		_log("Загрузка %d новых файлов..." % files_to_upload.size(), Color.AQUA)
+		var uploaded = await _start_queue(files_to_upload, true)
+		if uploaded.size() != files_to_upload.size(): _finish(false, "Ошибка загрузки."); return
+		for u in uploaded: final_tree_items.append(u)
+	else:
+		_log("Дедупликация: загрузка не требуется.", Color.GREEN)
+
 	var deleted_count = 0
 	for old in old_remote_files:
 		var p = old["path"]
 		if old["type"] != "blob": continue
-		if processed_paths.has(p): continue
+		if processed_local_paths.has(p): continue
 		
 		if FileAccess.file_exists("res://" + p):
-			final_tree.append({ "path": p, "mode": old["mode"], "type": "blob", "sha": old["sha"] })
+			final_tree_items.append({ "path": p, "mode": old["mode"], "type": "blob", "sha": old["sha"] })
 		else:
-			if _is_ignored("res://" + p):
-				final_tree.append({ "path": p, "mode": old["mode"], "type": "blob", "sha": old["sha"] })
-			else: deleted_count += 1
+			if not _is_ignored("res://" + p): deleted_count += 1
+			else: final_tree_items.append({ "path": p, "mode": old["mode"], "type": "blob", "sha": old["sha"] })
+
+	if auto_msg_files.is_empty() and deleted_count == 0:
+		_finish(true, "Нет изменений.")
+		return
 	
-	if uploaded_blobs.is_empty() and deleted_count == 0: _finish(true, "Нет изменений."); return
-	_log("Коммит (Upd: %d, Del: %d)..." % [uploaded_blobs.size(), deleted_count], Color.AQUA)
-	
-	var new_tree_sha = await _create_tree(final_tree)
+	if message.strip_edges() == "":
+		var f_names = ", ".join(auto_msg_files.slice(0, 3))
+		if auto_msg_files.size() > 3: f_names += " (+%d)" % (auto_msg_files.size() - 3)
+		message = "Upd: " + f_names
+		if deleted_count > 0: message += ", Del: %d" % deleted_count
+
+	_log("Коммит: " + message, Color.AQUA)
+	var new_tree_sha = await _create_tree(final_tree_items)
 	if not new_tree_sha: _finish(false, "Ошибка Tree."); return
 	var commit_sha = await _create_commit(message, new_tree_sha, base_sha)
 	if not commit_sha: _finish(false, "Ошибка Commit."); return
@@ -134,14 +171,71 @@ func _do_push(base_sha, local_files_paths: Array, message: String):
 	if ok: last_known_sha = commit_sha; _finish(true, "Успех!")
 	else: _finish(false, "Конфликт.")
 
+# ==============================================================================
+# HASHING HELPER (ИСПРАВЛЕНО)
+# ==============================================================================
+func _calculate_git_sha(path: String) -> String:
+	var f = FileAccess.open(path, FileAccess.READ)
+	if not f: return ""
+	var content = f.get_buffer(f.get_length())
+	
+	# ИСПРАВЛЕНИЕ: Создаем заголовок без использования \0 в строке
+	var header_str = "blob " + str(content.size())
+	var header_bytes = header_str.to_utf8_buffer()
+	header_bytes.append(0) # Добавляем нулевой байт как байт, а не символ строки
+	
+	var ctx = HashingContext.new()
+	ctx.start(HashingContext.HASH_SHA1)
+	ctx.update(header_bytes)
+	ctx.update(content)
+	return ctx.finish().hex_encode()
+
+# ==============================================================================
+# NETWORK
+# ==============================================================================
+func _headers(): return ["Authorization: token " + token.strip_edges(), "Accept: application/vnd.github.v3+json", "Accept-Encoding: gzip, deflate", "User-Agent: GodotGitPro"]
+func _api(m, ep, d=null):
+	var h = HTTPRequest.new(); h.set_tls_options(TLSOptions.client_unsafe()); add_child(h)
+	h.request("https://api.github.com/repos/%s/%s%s" % [owner_name.strip_edges(), repo_name.strip_edges(), ep], _headers(), m, JSON.stringify(d) if d else "")
+	var r = await h.request_completed; h.queue_free()
+	return { "c": r[1], "d": JSON.parse_string(r[3].get_string_from_utf8()) }
+
+func _get_sha(b): var r = await _api(0, "/git/refs/heads/" + b); return r.d.get("object", {}).get("sha", "")
+func _get_commit_tree(s): var r = await _api(0, "/git/commits/" + s); return r.d.get("tree", {}).get("sha", "")
+func _get_tree_recursive(s): var r = await _api(0, "/git/trees/%s?recursive=1" % s); return r.d.get("tree", [])
+func _create_tree(t): var r = await _api(HTTPClient.METHOD_POST, "/git/trees", {"tree": t}); return r.d.get("sha", "")
+func _create_commit(m, t, p): var r = await _api(HTTPClient.METHOD_POST, "/git/commits", {"message": m, "tree": t, "parents": [p]}); return r.d.get("sha", "")
+func _update_ref(b, s): var r = await _api(HTTPClient.METHOD_PATCH, "/git/refs/heads/" + b, {"sha": s}); return r.c == 200
+
+func _fetch_user():
+	var h = HTTPRequest.new(); h.set_tls_options(TLSOptions.client_unsafe()); add_child(h)
+	h.request("https://api.github.com/user", _headers(), 0)
+	var r = await h.request_completed; h.queue_free()
+	if r[1] == 200:
+		var d = JSON.parse_string(r[3].get_string_from_utf8())
+		if d:
+			user_data.login = d.get("login", "")
+			user_data.name = d.get("name", user_data.login)
+			if user_data.name == null: user_data.name = user_data.login
+			_load_avatar(d.get("avatar_url"))
+			call_deferred("emit_signal", "state_changed")
+
+func _load_avatar(url):
+	if !url: return
+	var h = HTTPRequest.new(); h.set_tls_options(TLSOptions.client_unsafe()); add_child(h)
+	h.request(url); var r = await h.request_completed; h.queue_free()
+	if r[1] == 200:
+		var i = Image.new()
+		if i.load_jpg_from_buffer(r[3]) != OK: if i.load_png_from_buffer(r[3]) != OK: i.load_webp_from_buffer(r[3])
+		user_data.avatar = ImageTexture.create_from_image(i)
+		call_deferred("emit_signal", "state_changed")
+
 func _check_remote_updates():
 	if not token or not repo_name: return
 	var sha = await _get_sha(branch)
 	if sha and last_known_sha and sha != last_known_sha: emit_signal("remote_update_detected")
 
-# ==============================================================================
-# QUEUE
-# ==============================================================================
+# --- QUEUE ---
 var _q_items = []; var _q_res = []; var _q_act = 0; var _q_tot = 0; var _q_up = false; signal _q_done
 func _start_queue(items, up) -> Array:
 	_q_items = items.duplicate(); _q_res = []; _q_tot = items.size(); _q_up = up; _q_act = 0
@@ -178,51 +272,7 @@ func _run_w(i, item):
 		else: _end.call(null)
 	else: _end.call(null)
 
-# ==============================================================================
-# API & AUTH
-# ==============================================================================
-func _headers(): return ["Authorization: token " + token.strip_edges(), "Accept: application/vnd.github.v3+json", "User-Agent: GodotGitPro"]
-func _api(m, ep, d=null):
-	var h = HTTPRequest.new(); h.set_tls_options(TLSOptions.client_unsafe()); add_child(h)
-	h.request("https://api.github.com/repos/%s/%s%s" % [owner_name.strip_edges(), repo_name.strip_edges(), ep], _headers(), m, JSON.stringify(d) if d else "")
-	var r = await h.request_completed; h.queue_free()
-	return { "c": r[1], "d": JSON.parse_string(r[3].get_string_from_utf8()) }
-
-func _get_sha(b): var r = await _api(0, "/git/refs/heads/" + b); return r.d.get("object", {}).get("sha", "")
-func _get_commit_tree(s): var r = await _api(0, "/git/commits/" + s); return r.d.get("tree", {}).get("sha", "")
-func _get_tree_recursive(s): var r = await _api(0, "/git/trees/%s?recursive=1" % s); return r.d.get("tree", [])
-func _create_tree(t): var r = await _api(HTTPClient.METHOD_POST, "/git/trees", {"tree": t}); return r.d.get("sha", "")
-func _create_commit(m, t, p): var r = await _api(HTTPClient.METHOD_POST, "/git/commits", {"message": m, "tree": t, "parents": [p]}); return r.d.get("sha", "")
-func _update_ref(b, s): var r = await _api(HTTPClient.METHOD_PATCH, "/git/refs/heads/" + b, {"sha": s}); return r.c == 200
-
-# ИСПРАВЛЕННЫЙ ВХОД В АККАУНТ
-func _fetch_user():
-	var h = HTTPRequest.new(); h.set_tls_options(TLSOptions.client_unsafe()); add_child(h)
-	# Используем прямой URL, а не через _api (который добавляет /repos/...)
-	h.request("https://api.github.com/user", _headers(), HTTPClient.METHOD_GET)
-	var r = await h.request_completed; h.queue_free()
-	
-	if r[1] == 200:
-		var d = JSON.parse_string(r[3].get_string_from_utf8())
-		if d:
-			user_data.login = d.get("login", "")
-			user_data.name = d.get("name", user_data.login)
-			if user_data.name == null: user_data.name = user_data.login
-			_load_avatar(d.get("avatar_url"))
-			call_deferred("emit_signal", "state_changed")
-	else:
-		print("[GitPro] Login Error: ", r[1])
-
-func _load_avatar(url):
-	if !url: return
-	var h = HTTPRequest.new(); h.set_tls_options(TLSOptions.client_unsafe()); add_child(h)
-	h.request(url); var r = await h.request_completed; h.queue_free()
-	if r[1] == 200:
-		var i = Image.new()
-		if i.load_jpg_from_buffer(r[3]) != OK: if i.load_png_from_buffer(r[3]) != OK: i.load_webp_from_buffer(r[3])
-		user_data.avatar = ImageTexture.create_from_image(i)
-		call_deferred("emit_signal", "state_changed")
-
+# --- UTILS ---
 func _log(m, c): emit_signal("log_msg", m, c); print("[GitPro] ", m)
 func _finish(s, m): _log(m, Color.GREEN if s else Color.RED); emit_signal("operation_done", s)
 func _is_ignored(path: String) -> bool: return path.contains("/.godot/") or path.contains("/.git/") or path.ends_with(".uid") or path.ends_with(".bak")

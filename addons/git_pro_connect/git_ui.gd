@@ -34,6 +34,7 @@ func _connect_signals():
 		if ui_refs.has("sync_btn"):
 			ui_refs.sync_btn.disabled=false; ui_refs.sync_btn.text="СИНХРОНИЗИРОВАТЬ"
 			ui_refs.sync_btn.modulate = Color.WHITE
+			ui_refs.comment.text = ""
 			_refresh_file_list()
 	)
 	core.state_changed.connect(_refresh_view)
@@ -47,8 +48,7 @@ func _on_fs_changed():
 func _on_remote_update():
 	if ui_refs.has("sync_btn"):
 		ui_refs.sync_btn.modulate = Color.GREEN
-		ui_refs.sync_btn.text = "ЕСТЬ ОБНОВЛЕНИЯ (ЖМИ)"
-		ui_refs.status.text = "Доступна новая версия!"
+		ui_refs.sync_btn.text = "СЕРВЕР ОБНОВИЛСЯ (ЖМИ)"
 
 func _create_layout():
 	for c in get_children(): c.queue_free()
@@ -58,14 +58,7 @@ func _create_layout():
 	# HEADER
 	var head = HBoxContainer.new()
 	var m = MarginContainer.new(); m.add_theme_constant_override("margin_left", 8); m.add_theme_constant_override("margin_top", 5); m.add_theme_constant_override("margin_right", 8); m.add_child(head); main_col.add_child(m)
-	
-	# ИСПРАВЛЕНА АВАТАРКА
-	ui_refs.avatar = TextureRect.new()
-	ui_refs.avatar.custom_minimum_size=Vector2(24,24)
-	ui_refs.avatar.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	ui_refs.avatar.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	ui_refs.avatar.texture=icons.user
-	
+	ui_refs.avatar = TextureRect.new(); ui_refs.avatar.custom_minimum_size=Vector2(24,24); ui_refs.avatar.expand_mode=1; ui_refs.avatar.stretch_mode=5; ui_refs.avatar.texture=icons.user
 	ui_refs.username = Label.new(); ui_refs.username.text = "Гость"
 	var btn_cfg = Button.new(); btn_cfg.icon = icons.gear; btn_cfg.flat=true; btn_cfg.pressed.connect(func(): _set_page("settings"))
 	head.add_child(ui_refs.avatar); head.add_child(ui_refs.username); head.add_child(Control.new()); head.get_child(-1).size_flags_horizontal=3; head.add_child(btn_cfg); main_col.add_child(HSeparator.new())
@@ -82,7 +75,7 @@ func _create_layout():
 	var b_paste = Button.new(); b_paste.icon=icons.clip; b_paste.pressed.connect(func(): t_tok.text=DisplayServer.clipboard_get(); core.save_token(t_tok.text))
 	hb_tok.add_child(t_tok); hb_tok.add_child(b_paste)
 	var b_login = Button.new(); b_login.text="ВОЙТИ"; b_login.modulate=Color.GREEN; b_login.pressed.connect(func(): core.save_token(t_tok.text))
-	lb.add_child(Label.new()); lb.get_child(0).text="GitPro v4.1"; lb.get_child(0).horizontal_alignment=1; lb.add_child(b_get); lb.add_child(hb_tok); lb.add_child(b_login)
+	lb.add_child(Label.new()); lb.get_child(0).text="GitPro v5.1"; lb.get_child(0).horizontal_alignment=1; lb.add_child(b_get); lb.add_child(hb_tok); lb.add_child(b_login)
 	
 	# FILES
 	var p_files = VBoxContainer.new(); pages["files"]=p_files; body.add_child(p_files)
@@ -100,7 +93,7 @@ func _create_layout():
 
 	# FOOTER
 	var foot = VBoxContainer.new(); var fm = MarginContainer.new(); fm.add_theme_constant_override("margin_left",5); fm.add_theme_constant_override("margin_right",5); fm.add_theme_constant_override("margin_bottom",5); fm.add_child(foot); main_col.add_child(fm)
-	ui_refs.comment = LineEdit.new(); ui_refs.comment.placeholder_text="Что нового?"
+	ui_refs.comment = LineEdit.new(); ui_refs.comment.placeholder_text="Оставьте пустым для авто-коммента..."
 	foot.add_child(ui_refs.comment)
 	
 	ui_refs.sync_btn = Button.new()
@@ -158,7 +151,7 @@ func _on_sync_click():
 	var paths = []
 	_get_checked(ui_refs.tree.get_root(), paths)
 	ui_refs.sync_btn.disabled = true
-	core.smart_sync(paths, ui_refs.comment.text if ui_refs.comment.text else "Update")
+	core.smart_sync(paths, ui_refs.comment.text if ui_refs.comment.text else "")
 
 func _get_checked(it, list):
 	if not it: return
