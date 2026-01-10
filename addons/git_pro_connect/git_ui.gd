@@ -5,7 +5,7 @@ var core
 var main_col: VBoxContainer
 var pages = {}; var ui_refs = {}; var icons = {}
 
-# Цвета (Палитра)
+# Цвета
 const COL_SUCCESS = Color.SPRING_GREEN
 const COL_ERROR = Color.TOMATO
 const COL_INFO = Color.DEEP_SKY_BLUE
@@ -38,7 +38,7 @@ func _load_icons():
 		"reload": g.call("Reload"), "gear": g.call("Tools"), "user": g.call("Skeleton2D"), "sync": g.call("AssetLib"),
 		"branch": g.call("GraphNode"), "issue": g.call("Error"), "add": g.call("Add"), 
 		"remove": g.call("Remove"), "lock": g.call("CryptoKey"), "clip": g.call("ActionCopy"), "chat": g.call("String"),
-		"web": g.call("ExternalLink"), "warn": g.call("NodeWarning")
+		"web": g.call("ExternalLink"), "warn": g.call("NodeWarning"), "check": g.call("ImportCheck")
 	}
 
 func _connect_signals():
@@ -111,7 +111,7 @@ func _create_layout():
 	var b_paste=Button.new(); b_paste.icon=icons.clip; b_paste.pressed.connect(func(): t_tok.text=DisplayServer.clipboard_get(); core.save_token(t_tok.text))
 	hb_tok.add_child(t_tok); hb_tok.add_child(b_paste)
 	var b_log=Button.new(); b_log.text="АВТОРИЗАЦИЯ"; b_log.modulate=COL_SUCCESS; b_log.pressed.connect(func(): core.save_token(t_tok.text))
-	lb.add_child(Label.new()); lb.get_child(0).text="GitPro v13.1"; lb.get_child(0).horizontal_alignment=1; lb.add_child(b_get); lb.add_child(hb_tok); lb.add_child(b_log)
+	lb.add_child(Label.new()); lb.get_child(0).text="GitPro v14.1"; lb.get_child(0).horizontal_alignment=1; lb.add_child(b_get); lb.add_child(hb_tok); lb.add_child(b_log)
 	
 	var tabs=TabContainer.new(); pages["files"]=tabs; body.add_child(tabs)
 	
@@ -143,7 +143,7 @@ func _create_layout():
 	p_set.add_child(Label.new()); p_set.get_child(0).text="Настройки проекта"; p_set.add_child(ui_refs.inp_owner); p_set.add_child(ui_refs.inp_repo); p_set.add_child(b_sv); p_set.add_child(b_bk)
 
 	var foot=VBoxContainer.new(); var fm=MarginContainer.new(); fm.add_theme_constant_override("margin_left",5); fm.add_theme_constant_override("margin_right",5); fm.add_theme_constant_override("margin_bottom",5); fm.add_child(foot); main_col.add_child(fm)
-	ui_refs.comment=LineEdit.new(); ui_refs.comment.placeholder_text="Сообщение коммита (обязательно при создании файлов)..."; foot.add_child(ui_refs.comment)
+	ui_refs.comment=LineEdit.new(); ui_refs.comment.placeholder_text="Сообщение коммита..."; foot.add_child(ui_refs.comment)
 	ui_refs.sync_btn=Button.new(); ui_refs.sync_btn.text="СИНХРОНИЗИРОВАТЬ"; ui_refs.sync_btn.icon=icons.sync; ui_refs.sync_btn.custom_minimum_size.y=35; ui_refs.sync_btn.pressed.connect(_on_sync_click); foot.add_child(ui_refs.sync_btn)
 	ui_refs.progress=ProgressBar.new(); ui_refs.progress.visible=false; foot.add_child(ui_refs.progress)
 	ui_refs.status=Label.new(); ui_refs.status.text="Готов"; ui_refs.status.modulate=Color.GRAY; ui_refs.status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER; foot.add_child(ui_refs.status)
@@ -212,7 +212,7 @@ func _update_info_label():
 
 func _set_page(n): for k in pages: pages[k].visible=(k==n); if n=="files": _refresh_file_list()
 
-# === FILES (ИСПРАВЛЕНА ЛОГИКА ВЫБОРА) ===
+# === FILES ===
 func _refresh_file_list():
 	if !ui_refs.has("tree"): return
 	ui_refs.tree.clear(); var root = ui_refs.tree.create_item(); _scan_rec("res://", root)
@@ -237,42 +237,27 @@ func _scan_rec(path, parent):
 			it.set_cell_mode(0, TreeItem.CELL_MODE_CHECK)
 			it.set_checked(0, true) # По умолчанию выбрано
 			it.set_editable(0, true)
-			it.set_metadata(0, i.p) # Важно: путь в метаданных
+			it.set_metadata(0, i.p)
 			var ext=i.n.get_extension(); it.set_icon(1, icons.script if ["gd","cs"].has(ext) else (icons.scene if ["tscn","tres"].has(ext) else icons.file))
 
 func _on_sync_click(): 
 	var paths = []
 	_get_checked_recursive(ui_refs.tree.get_root(), paths)
-	
-	if paths.is_empty(): 
-		core._finish(false, "Не выбрано ни одного файла.")
-		return
-	
+	if paths.is_empty(): core._finish(false, "Не выбрано ни одного файла."); return
 	core.smart_sync(paths, ui_refs.comment.text if ui_refs.comment.text else "")
 
 func _get_checked_recursive(it: TreeItem, list: Array):
 	if !it: return
-	
-	# Проверяем текущий элемент
 	if it.get_cell_mode(0) == TreeItem.CELL_MODE_CHECK and it.is_checked(0):
 		var path = it.get_metadata(0)
-		if path is String:
-			list.append(path)
-	
-	# Рекурсия по детям
+		if path is String: list.append(path)
 	var child = it.get_first_child()
-	while child:
-		_get_checked_recursive(child, list)
-		child = child.get_next()
+	while child: _get_checked_recursive(child, list); child = child.get_next()
 
 func _set_checked_recursive(it, v):
 	if !it: return
-	if it.get_cell_mode(0) == TreeItem.CELL_MODE_CHECK: 
-		it.set_checked(0, v)
-	var c = it.get_first_child()
-	while c:
-		_set_checked_recursive(c, v)
-		c = c.get_next()
+	if it.get_cell_mode(0) == TreeItem.CELL_MODE_CHECK: it.set_checked(0, v)
+	var c = it.get_first_child(); while c: _set_checked_recursive(c, v); c = c.get_next()
 
 func _on_tree_rmb(pos, button_index): 
 	if button_index == MOUSE_BUTTON_RIGHT: 
@@ -283,9 +268,7 @@ func _on_tree_rmb(pos, button_index):
 
 func _on_context_menu_action(id):
 	var it = ui_refs.tree.get_selected()
-	if not it:
-		return
-		
+	if !it: return
 	var path = it.get_metadata(0)
 	
 	match id:
@@ -389,17 +372,19 @@ func _on_post_comment():
 		ui_refs.iv_chat.append_text("[i]Отправка...[/i]\n")
 
 func _on_toggle_issue_state(): 
-	var is_open=ui_refs.iv_state_btn.text=="Закрыть задачу"
-	core.change_issue_state(current_issue_num, is_open)
+	var is_open = ui_refs.iv_state_btn.text == "✅ Завершить задачу"
+	# Если сейчас открыто (кнопка "Завершить"), то мы закрываем (is_closed = true)
+	# Логика инвертирована в функции change_issue_state, передаем is_closed
+	core.change_issue_state(current_issue_num, is_open) 
 	ui_refs.iv_state_btn.disabled=true
 
 func _update_issue_state_btn(is_open): 
 	ui_refs.iv_state_btn.disabled=false
 	if is_open: 
-		ui_refs.iv_state_btn.text="Закрыть задачу"
-		ui_refs.iv_state_btn.modulate=COL_ERROR
-	else: 
-		ui_refs.iv_state_btn.text="Открыть задачу"
+		ui_refs.iv_state_btn.text="✅ Завершить задачу"
 		ui_refs.iv_state_btn.modulate=COL_SUCCESS
+	else: 
+		ui_refs.iv_state_btn.text="🔥 Вернуть в работу"
+		ui_refs.iv_state_btn.modulate=COL_WARN
 
 func _input_dialog(title, cb): var dlg=ConfirmationDialog.new(); dlg.title=title; var l=LineEdit.new(); dlg.add_child(l); add_child(dlg); dlg.popup_centered(Vector2(250,80)); dlg.confirmed.connect(func(): cb.call(l.text); dlg.queue_free())

@@ -2,11 +2,16 @@
 extends EditorPlugin
 class_name GitProCore
 
-const VERSION = "13.1 FIX"
+const VERSION = "14.1 Stable"
 const USER_CFG = "user://git_pro_auth.cfg"
 const PROJ_CFG = "res://addons/git_pro_connect/git_project_config.cfg"
-const SYNC_INTERVAL = 60.0
-const MAX_FILE_SIZE = 99 * 1024 * 1024 # 99 MB Лимит
+
+# ОПТИМИЗАЦИЯ ПОД МЕДЛЕННЫЙ ИНТЕРНЕТ
+const SYNC_INTERVAL = 120.0 
+const REQUEST_TIMEOUT = 180.0
+const MAX_RETRIES = 3 
+const RETRY_DELAY = 3.0 
+const MAX_FILE_SIZE = 50 * 1024 * 1024
 
 # --- ДАННЫЕ ---
 var token = ""
@@ -42,9 +47,10 @@ signal file_reverted(path: String)
 
 func _enter_tree():
 	hash_thread = Thread.new()
-	for i in range(4): 
+	# 2 потока для стабильности на слабом интернете
+	for i in range(2): 
 		var r = HTTPRequest.new()
-		r.timeout = 60.0
+		r.timeout = REQUEST_TIMEOUT
 		r.set_tls_options(TLSOptions.client_unsafe())
 		add_child(r)
 		http_pool.append(r)
@@ -95,13 +101,13 @@ func smart_sync(local_files: Array, message: String):
 	for p in local_files:
 		var f = FileAccess.open(p, FileAccess.READ)
 		if f and f.get_length() > MAX_FILE_SIZE:
-			_finish(false, "Критично: Файл >99MB (GitHub не примет): " + p.get_file())
+			_finish(false, "Файл слишком большой (>50MB): " + p.get_file())
 			return
 
 	# 2. SHA ветки
 	var remote_head = await _get_sha(branch)
 	if not remote_head: 
-		_finish(false, "Нет связи с GitHub или репозиторий пуст.")
+		_finish(false, "Нет связи с GitHub. Проверьте интернет.")
 		return
 
 	if last_known_sha == "":
@@ -109,7 +115,7 @@ func smart_sync(local_files: Array, message: String):
 
 	# 3. Pull
 	if remote_head != last_known_sha:
-		_log("Сервер обновился. Скачиваю изменения (Pull)...", Color.DEEP_SKY_BLUE)
+		_log("Сервер обновился. Скачиваю изменения...", Color.DEEP_SKY_BLUE)
 		var ok = await _do_pull(remote_head)
 		if not ok: return
 	
@@ -143,7 +149,7 @@ func _start_push_process(base_sha, local_paths, msg):
 	if not hash_thread:
 		hash_thread = Thread.new()
 		
-	emit_signal("progress", "Вычисление хешей...", 0, local_paths.size())
+	emit_signal("progress", "Хеширование (CPU)...", 0, local_paths.size())
 	hash_thread.start(_thread_hashing_task.bind([base_sha, local_paths, msg]))
 
 func _thread_hashing_task(args):
@@ -166,7 +172,7 @@ func _finalize_push(base_sha, local_paths, msg, local_hashes):
 	if hash_thread and hash_thread.is_started():
 		hash_thread.wait_to_finish()
 		
-	_log("Анализ изменений...", Color.GOLD)
+	_log("Сверка с сервером...", Color.GOLD)
 	
 	var old_tree_sha = await _get_commit_tree(base_sha)
 	var old_files = await _get_tree_recursive(old_tree_sha)
@@ -195,7 +201,7 @@ func _finalize_push(base_sha, local_paths, msg, local_hashes):
 		_log("Загрузка файлов (%d)..." % to_upload.size(), Color.DEEP_SKY_BLUE)
 		var uploaded = await _start_queue(to_upload, true)
 		if uploaded.size() != to_upload.size(): 
-			_finish(false, "Ошибка сети при загрузке файлов.")
+			_finish(false, "Сбой сети. Повторите попытку.")
 			return
 		for u in uploaded:
 			final_tree.append(u)
@@ -218,11 +224,11 @@ func _finalize_push(base_sha, local_paths, msg, local_hashes):
 		return
 	
 	if msg.strip_edges() == "": 
-		msg = "Обновление: " + ", ".join(auto_msg_files.slice(0, 2))
+		msg = "Upd: " + ", ".join(auto_msg_files.slice(0, 2))
 		if auto_msg_files.size() > 2: msg += "..."
-		if del_cnt > 0: msg += ", Удалено: %d" % del_cnt
+		if del_cnt > 0: msg += ", Del: %d" % del_cnt
 
-	_log("Фиксация коммита...", Color.DEEP_SKY_BLUE)
+	_log("Создание коммита...", Color.DEEP_SKY_BLUE)
 	var new_tree = await _create_tree(final_tree)
 	if not new_tree:
 		_finish(false, "Ошибка создания Tree")
@@ -235,14 +241,64 @@ func _finalize_push(base_sha, local_paths, msg, local_hashes):
 	
 	if await _update_ref(branch, commit): 
 		last_known_sha = commit
-		_finish(true, "Успешно синхронизировано!")
+		_finish(true, "Готово! Синхронизация успешна.")
 		fetch_history()
 	else: 
-		_finish(false, "Конфликт версий. Повторите попытку.")
+		_finish(false, "Конфликт версий.")
 
 # ==============================================================================
-# API & UTILS
+# NETWORK CORE (RETRY SYSTEM)
 # ==============================================================================
+func _headers():
+	return ["Authorization: token " + token.strip_edges(), "Accept: application/vnd.github.v3+json", "User-Agent: GodotGitPro"]
+
+func _attempt_request(req_node: HTTPRequest, url: String, method: int, data: String = "") -> Array:
+	var attempts = 0
+	var response = []
+	
+	while attempts < MAX_RETRIES:
+		var err = req_node.request(url, _headers(), method, data)
+		if err != OK:
+			attempts += 1
+			await get_tree().create_timer(RETRY_DELAY).timeout
+			continue
+			
+		response = await req_node.request_completed
+		
+		# Успех 200-299
+		if response[1] >= 200 and response[1] < 300:
+			if response[2].has("X-RateLimit-Remaining"):
+				rate_limit_remaining = response[2]["X-RateLimit-Remaining"]
+			return response
+		
+		# Ошибка - пробуем снова
+		attempts += 1
+		print("[GitPro] Сбой сети (Code %d). Попытка %d/%d..." % [response[1], attempts + 1, MAX_RETRIES])
+		await get_tree().create_timer(RETRY_DELAY).timeout
+	
+	return response
+
+func _api(m, ep, d=null, use_repo=true):
+	var h = HTTPRequest.new()
+	h.timeout = REQUEST_TIMEOUT
+	h.set_tls_options(TLSOptions.client_unsafe())
+	add_child(h)
+	
+	var base = "https://api.github.com/repos/%s/%s"%[owner_name,repo_name] if use_repo else "https://api.github.com"
+	var url = base + ep
+	var body = JSON.stringify(d) if d else ""
+	
+	var r = await _attempt_request(h, url, m, body)
+	h.queue_free()
+	
+	var json = null
+	if r.size() > 3 and r[1] != 204 and r[3].size() > 0:
+		var test_json = JSON.parse_string(r[3].get_string_from_utf8())
+		if test_json != null:
+			json = test_json
+	
+	return { "c": r[1] if r.size() > 1 else 0, "d": json }
+
 func _calculate_git_sha(path: String) -> String:
 	var f = FileAccess.open(path, FileAccess.READ)
 	if not f: return ""
@@ -254,29 +310,6 @@ func _calculate_git_sha(path: String) -> String:
 	ctx.update(header)
 	ctx.update(content)
 	return ctx.finish().hex_encode()
-
-func _headers():
-	return ["Authorization: token " + token.strip_edges(), "Accept: application/vnd.github.v3+json", "User-Agent: GodotGitPro"]
-
-func _api(m, ep, d=null, use_repo=true):
-	var h = HTTPRequest.new()
-	h.set_tls_options(TLSOptions.client_unsafe())
-	add_child(h)
-	var base = "https://api.github.com/repos/%s/%s"%[owner_name,repo_name] if use_repo else "https://api.github.com"
-	h.request(base + ep, _headers(), m, JSON.stringify(d) if d else "")
-	var r = await h.request_completed
-	h.queue_free()
-	
-	if r[2].has("X-RateLimit-Remaining"):
-		rate_limit_remaining = r[2]["X-RateLimit-Remaining"]
-	
-	var json = null
-	if r[1] != 204 and r[3].size() > 0:
-		var test_json = JSON.parse_string(r[3].get_string_from_utf8())
-		if test_json != null:
-			json = test_json
-			
-	return { "c": r[1], "d": json }
 
 func revert_file(path: String):
 	_log("Откат файла...", Color.GOLD)
@@ -302,9 +335,9 @@ func revert_file(path: String):
 			f.close()
 			EditorInterface.get_resource_filesystem().scan()
 			emit_signal("file_reverted", path)
-			_finish(true, "Файл восстановлен до версии сервера.")
+			_finish(true, "Файл восстановлен!")
 
-# Shortened API wrappers (Expanded for safety)
+# API Wrappers
 func _get_sha(b):
 	var r = await _api(0, "/git/refs/heads/" + b)
 	return r.d.get("object", {}).get("sha", "")
@@ -507,7 +540,7 @@ func _finish(s, m):
 	_log(m, Color.SPRING_GREEN if s else Color.TOMATO)
 	emit_signal("operation_done", s)
 
-# --- QUEUE ---
+# --- QUEUE SYSTEM (FIXED) ---
 var _q_items = []
 var _q_res = []
 var _q_act = 0
@@ -523,7 +556,8 @@ func _start_queue(i, u):
 	_q_act = 0
 	emit_signal("progress", "Старт", 0, _q_tot)
 	
-	for x in 4: 
+	# Используем только 2 потока
+	for x in range(2): 
 		http_busy[x] = false
 	
 	_pump()
@@ -535,8 +569,8 @@ func _pump():
 		emit_signal("_q_done")
 		return
 	
-	for x in 4: 
-		if !_q_items.is_empty() and !http_busy[x]: 
+	for x in range(2): 
+		if not _q_items.is_empty() and not http_busy[x]: 
 			_q_act += 1
 			http_busy[x] = true
 			_run_w(x, _q_items.pop_front())
@@ -545,27 +579,31 @@ func _run_w(i, item):
 	var req = http_pool[i]
 	req.cancel_request()
 	var url = "https://api.github.com/repos/%s/%s/git/blobs" % [owner_name, repo_name]
+	var method = HTTPClient.METHOD_GET
+	var body = ""
 	
 	if _q_up: 
 		var f = FileAccess.open(item["path"], FileAccess.READ)
 		if f: 
+			method = HTTPClient.METHOD_POST
 			var b64 = Marshalls.raw_to_base64(f.get_buffer(f.get_length()))
-			req.request(url, _headers(), HTTPClient.METHOD_POST, JSON.stringify({"content": b64, "encoding": "base64"}))
+			body = JSON.stringify({"content": b64, "encoding": "base64"})
 		else: 
 			_q_end(i, null)
 			return
-	else: 
-		req.request(url + "/" + item["sha"], _headers(), HTTPClient.METHOD_GET)
+	else:
+		url += "/" + item["sha"]
 	
-	var r = await req.request_completed
+	# Асинхронный вызов с ожиданием повторов
+	var r = await _attempt_request(req, url, method, body)
 	
-	if r[1] in [200, 201]: 
+	if r.size() > 1 and (r[1] == 200 or r[1] == 201):
 		var j = JSON.parse_string(r[3].get_string_from_utf8())
-		if _q_up: 
+		if _q_up:
 			_q_end(i, {"path": item["path"].replace("res://", ""), "mode": "100644", "type": "blob", "sha": j["sha"]})
-		else: 
+		else:
 			_q_end(i, {"path": item["path"], "data": Marshalls.base64_to_raw(j["content"])})
-	else: 
+	else:
 		_q_end(i, null)
 
 func _q_end(i, res): 
