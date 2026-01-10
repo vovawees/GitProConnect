@@ -23,7 +23,8 @@ func _load_icons():
 		"folder": g.call("Folder"), "file": g.call("File"), "script": g.call("Script"), 
 		"scene": g.call("PackedScene"), "reload": g.call("Reload"), "gear": g.call("Tools"),
 		"user": g.call("Skeleton2D"), "save": g.call("Save"), "down": g.call("MoveDown"), 
-		"lock": g.call("CryptoKey"), "clip": g.call("ActionCopy"), "sync": g.call("AssetLib")
+		"lock": g.call("CryptoKey"), "clip": g.call("ActionCopy"), "sync": g.call("AssetLib"),
+		"update": g.call("AssetLib")
 	}
 
 func _connect_signals():
@@ -39,6 +40,7 @@ func _connect_signals():
 	)
 	core.state_changed.connect(_refresh_view)
 	core.remote_update_detected.connect(_on_remote_update)
+	core.plugin_update_available.connect(_on_plugin_update_available)
 	var fs = EditorInterface.get_resource_filesystem()
 	if not fs.filesystem_changed.is_connected(_on_fs_changed): fs.filesystem_changed.connect(_on_fs_changed)
 
@@ -49,6 +51,11 @@ func _on_remote_update():
 	if ui_refs.has("sync_btn"):
 		ui_refs.sync_btn.modulate = Color.GREEN
 		ui_refs.sync_btn.text = "СЕРВЕР ОБНОВИЛСЯ (ЖМИ)"
+
+func _on_plugin_update_available(v):
+	if ui_refs.has("update_btn"):
+		ui_refs.update_btn.visible = true
+		ui_refs.update_btn.text = "ДОСТУПНО ОБНОВЛЕНИЕ v%s" % v
 
 func _create_layout():
 	for c in get_children(): c.queue_free()
@@ -61,7 +68,20 @@ func _create_layout():
 	ui_refs.avatar = TextureRect.new(); ui_refs.avatar.custom_minimum_size=Vector2(24,24); ui_refs.avatar.expand_mode=1; ui_refs.avatar.stretch_mode=5; ui_refs.avatar.texture=icons.user
 	ui_refs.username = Label.new(); ui_refs.username.text = "Гость"
 	var btn_cfg = Button.new(); btn_cfg.icon = icons.gear; btn_cfg.flat=true; btn_cfg.pressed.connect(func(): _set_page("settings"))
-	head.add_child(ui_refs.avatar); head.add_child(ui_refs.username); head.add_child(Control.new()); head.get_child(-1).size_flags_horizontal=3; head.add_child(btn_cfg); main_col.add_child(HSeparator.new())
+	
+	# КНОПКА ОБНОВЛЕНИЯ ПЛАГИНА (СКРЫТА ПО УМОЛЧАНИЮ)
+	ui_refs.update_btn = Button.new()
+	ui_refs.update_btn.text = "UPDATE"
+	ui_refs.update_btn.icon = icons.update
+	ui_refs.update_btn.visible = false
+	ui_refs.update_btn.modulate = Color(1, 1, 0) # Желтый
+	ui_refs.update_btn.pressed.connect(func(): core.install_plugin_update())
+
+	head.add_child(ui_refs.avatar); head.add_child(ui_refs.username); 
+	head.add_child(Control.new()); head.get_child(-1).size_flags_horizontal=3; 
+	head.add_child(ui_refs.update_btn); # Добавляем кнопку обновления
+	head.add_child(btn_cfg); 
+	main_col.add_child(HSeparator.new())
 
 	# BODY
 	var body = PanelContainer.new(); body.size_flags_vertical=3; main_col.add_child(body)
@@ -75,7 +95,7 @@ func _create_layout():
 	var b_paste = Button.new(); b_paste.icon=icons.clip; b_paste.pressed.connect(func(): t_tok.text=DisplayServer.clipboard_get(); core.save_token(t_tok.text))
 	hb_tok.add_child(t_tok); hb_tok.add_child(b_paste)
 	var b_login = Button.new(); b_login.text="ВОЙТИ"; b_login.modulate=Color.GREEN; b_login.pressed.connect(func(): core.save_token(t_tok.text))
-	lb.add_child(Label.new()); lb.get_child(0).text="GitPro v5.1"; lb.get_child(0).horizontal_alignment=1; lb.add_child(b_get); lb.add_child(hb_tok); lb.add_child(b_login)
+	lb.add_child(Label.new()); lb.get_child(0).text="GitPro v6.0"; lb.get_child(0).horizontal_alignment=1; lb.add_child(b_get); lb.add_child(hb_tok); lb.add_child(b_login)
 	
 	# FILES
 	var p_files = VBoxContainer.new(); pages["files"]=p_files; body.add_child(p_files)
@@ -86,14 +106,14 @@ func _create_layout():
 	var p_set = VBoxContainer.new(); pages["settings"]=p_set; body.add_child(p_set)
 	ui_refs.inp_owner = LineEdit.new(); ui_refs.inp_owner.placeholder_text="Owner"
 	ui_refs.inp_repo = LineEdit.new(); ui_refs.inp_repo.placeholder_text="Repo"
-	var b_sv = Button.new(); b_sv.text="Сохранить"; b_sv.pressed.connect(func(): core.save_proj(ui_refs.inp_owner.text, ui_refs.inp_repo.text); _refresh_view())
+	var b_sv = Button.new(); b_sv.text="Сохранить общий конфиг"; b_sv.pressed.connect(func(): core.save_proj(ui_refs.inp_owner.text, ui_refs.inp_repo.text); _refresh_view())
 	var b_bk = Button.new(); b_bk.text="Назад"; b_bk.pressed.connect(func(): _set_page("files"))
 	var b_out = Button.new(); b_out.text="Выход"; b_out.modulate=Color.RED; b_out.pressed.connect(func(): core.save_token(""); _refresh_view())
-	p_set.add_child(Label.new()); p_set.get_child(0).text="Настройки"; p_set.add_child(ui_refs.inp_owner); p_set.add_child(ui_refs.inp_repo); p_set.add_child(b_sv); p_set.add_child(b_out); p_set.add_child(b_bk)
+	p_set.add_child(Label.new()); p_set.get_child(0).text="Общие настройки (vovawees/GitProConnect)"; p_set.add_child(ui_refs.inp_owner); p_set.add_child(ui_refs.inp_repo); p_set.add_child(b_sv); p_set.add_child(b_out); p_set.add_child(b_bk)
 
 	# FOOTER
 	var foot = VBoxContainer.new(); var fm = MarginContainer.new(); fm.add_theme_constant_override("margin_left",5); fm.add_theme_constant_override("margin_right",5); fm.add_theme_constant_override("margin_bottom",5); fm.add_child(foot); main_col.add_child(fm)
-	ui_refs.comment = LineEdit.new(); ui_refs.comment.placeholder_text="Оставьте пустым для авто-коммента..."
+	ui_refs.comment = LineEdit.new(); ui_refs.comment.placeholder_text="Авто-комментарий..."
 	foot.add_child(ui_refs.comment)
 	
 	ui_refs.sync_btn = Button.new()
@@ -109,11 +129,17 @@ func _create_layout():
 func _refresh_view():
 	if not core: return
 	if core.token == "": _set_page("login")
+	# Теперь репо проверяется по-другому, так как он дефолтный
 	elif core.repo_name == "": ui_refs.inp_owner.text = core.owner_name; ui_refs.inp_repo.text = core.repo_name; _set_page("settings")
 	else:
 		if core.user_data.get("name"): ui_refs.username.text = core.user_data.name
 		else: ui_refs.username.text = core.user_data.get("login", "Гость")
 		if core.user_data.get("avatar"): ui_refs.avatar.texture = core.user_data.avatar
+		
+		# Заполняем настройки текущими значениями (они теперь общие)
+		ui_refs.inp_owner.text = core.owner_name
+		ui_refs.inp_repo.text = core.repo_name
+		
 		_set_page("files")
 
 func _set_page(n):

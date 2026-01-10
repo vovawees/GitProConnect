@@ -3,10 +3,16 @@ extends EditorPlugin
 class_name GitProCore
 
 # --- КОНФИГ ---
-const USER_CFG = "user://git_pro_auth.cfg"
-const PROJ_CFG = "res://addons/git_pro_connect/git_config.cfg"
+const CURRENT_VERSION = "6.0"
+const USER_CFG = "user://git_pro_auth.cfg" # Личный токен (не шарится)
+# Этот файл лежит в проекте, он ОБЩИЙ для всех. Его надо закоммитить!
+const PROJ_CFG = "res://addons/git_pro_connect/git_project_config.cfg" 
 const BACKUP_EXT = ".bak"
 const SYNC_INTERVAL = 60.0 
+
+# --- ССЫЛКИ ОБНОВЛЕНИЯ ---
+const UPDATE_CHECK_URL = "https://raw.githubusercontent.com/vovawees/GitProConnect/main/addons/git_pro_connect/plugin.cfg"
+const UPDATE_ZIP_URL = "https://api.github.com/repos/vovawees/GitProConnect/zipball/main"
 
 # --- ДАННЫЕ ---
 var token = ""
@@ -22,13 +28,16 @@ var http_busy: Array[bool] = []
 var sync_timer: Timer
 var dock: Control
 
+# --- СИГНАЛЫ ---
 signal log_msg(text: String, color: Color)
 signal progress(step: String, current: int, total: int)
 signal state_changed
 signal operation_done(success: bool)
 signal remote_update_detected
+signal plugin_update_available(new_version: String) # Сигнал о новой версии плагина
 
 func _enter_tree():
+	# Создаем воркеры
 	for i in range(4):
 		var r = HTTPRequest.new(); r.timeout = 60.0; r.set_tls_options(TLSOptions.client_unsafe())
 		add_child(r); http_pool.append(r); http_busy.append(false)
@@ -36,6 +45,7 @@ func _enter_tree():
 	sync_timer = Timer.new(); sync_timer.wait_time = SYNC_INTERVAL; sync_timer.timeout.connect(_check_remote_updates)
 	add_child(sync_timer)
 	
+	_ensure_project_config_exists() # Создаем общий конфиг, если нет
 	_load_cfg()
 	
 	var ui_res = load("res://addons/git_pro_connect/git_ui.gd")
@@ -45,6 +55,10 @@ func _enter_tree():
 		add_control_to_dock(DOCK_SLOT_RIGHT_BL, dock)
 		
 	await get_tree().process_frame
+	
+	# Проверка обновления плагина при старте
+	_check_plugin_version()
+	
 	if token: 
 		_fetch_user()
 		sync_timer.start()
@@ -52,6 +66,92 @@ func _enter_tree():
 func _exit_tree():
 	if dock: remove_control_from_docks(dock); dock.free()
 	for r in http_pool: r.queue_free()
+
+# ==============================================================================
+# PLUGIN AUTO-UPDATE SYSTEM
+# ==============================================================================
+func _check_plugin_version():
+	var h = HTTPRequest.new(); add_child(h); h.set_tls_options(TLSOptions.client_unsafe())
+	h.request(UPDATE_CHECK_URL)
+	var r = await h.request_completed; h.queue_free()
+	
+	if r[1] == 200:
+		var text = r[3].get_string_from_utf8()
+		var regex = RegEx.new()
+		regex.compile("version=\"([0-9.]+)\"")
+		var result = regex.search(text)
+		if result:
+			var new_ver = result.get_string(1)
+			if _compare_versions(new_ver, CURRENT_VERSION):
+				print("[GitPro] Доступно обновление: v", new_ver)
+				emit_signal("plugin_update_available", new_ver)
+
+func install_plugin_update():
+	_log("Скачивание обновления...", Color.YELLOW)
+	var h = HTTPRequest.new(); add_child(h); h.set_tls_options(TLSOptions.client_unsafe())
+	h.request(UPDATE_ZIP_URL)
+	var r = await h.request_completed; h.queue_free()
+	
+	if r[1] == 200:
+		var zip = ZIPReader.new()
+		var err = zip.open_from_buffer(r[3])
+		if err == OK:
+			var files = zip.get_files()
+			var base_path = "res://addons/git_pro_connect/"
+			
+			for file in files:
+				# GitHub ZIP имеет корневую папку (напр. GitProConnect-main/), пропускаем её
+				if not file.contains("addons/git_pro_connect/"): continue
+				if file.ends_with("/"): continue # Пропускаем папки
+				
+				# Вырезаем путь, чтобы получить только имя файла внутри плагина
+				var local_name = file.get_file() 
+				# ВНИМАНИЕ: Это упрощение. Предполагается плоская структура или сохранение структуры.
+				# Для надежности просто берем файлы и кладем в корень плагина, если структура совпадает.
+				
+				# Читаем и пишем
+				var content = zip.read_file(file)
+				var f = FileAccess.open(base_path.path_join(local_name), FileAccess.WRITE)
+				if f: f.store_buffer(content)
+			
+			zip.close()
+			_log("Обновлено! Перезагрузите проект.", Color.GREEN)
+			EditorInterface.get_resource_filesystem().scan()
+			await get_tree().create_timer(1.0).timeout
+			EditorInterface.restart_editor(true)
+		else:
+			_finish(false, "Ошибка ZIP архива")
+	else:
+		_finish(false, "Ошибка скачивания обновления")
+
+func _compare_versions(v1: String, v2: String) -> bool:
+	var p1 = v1.split("."); var p2 = v2.split(".")
+	for i in range(min(p1.size(), p2.size())):
+		if p1[i].to_int() > p2[i].to_int(): return true
+		if p1[i].to_int() < p2[i].to_int(): return false
+	return false
+
+# ==============================================================================
+# SHARED CONFIG LOGIC
+# ==============================================================================
+func _ensure_project_config_exists():
+	if not FileAccess.file_exists(PROJ_CFG):
+		var c = ConfigFile.new()
+		# Дефолтные значения (Ваш репозиторий)
+		c.set_value("git", "owner", "vovawees")
+		c.set_value("git", "repo", "GitProConnect")
+		c.save(PROJ_CFG)
+
+func save_proj(o, r): 
+	owner_name = o.strip_edges()
+	repo_name = r.strip_edges()
+	var c = ConfigFile.new()
+	c.set_value("git", "owner", owner_name)
+	c.set_value("git", "repo", repo_name)
+	c.save(PROJ_CFG) # Сохраняем в общий файл
+	
+	# Сразу говорим движку, что файл изменился, чтобы он попал в список на коммит
+	EditorInterface.get_resource_filesystem().scan() 
 
 # ==============================================================================
 # SMART SYNC
@@ -94,33 +194,20 @@ func _do_pull(head_sha) -> bool:
 	return true
 
 func _do_push_optimized(base_sha, local_files_paths: Array, message: String):
-	_log("Анализ файлов (Hashing)...", Color.YELLOW)
-	
+	_log("Анализ файлов...", Color.YELLOW)
 	var old_tree_sha = await _get_commit_tree(base_sha)
 	var old_remote_files = await _get_tree_recursive(old_tree_sha)
 	
-	var remote_sha_map = {}
-	var remote_path_map = {}
-	
+	var remote_sha_map = {}; var remote_path_map = {}
 	for r in old_remote_files:
-		if r["type"] == "blob":
-			remote_sha_map[r["sha"]] = true
-			remote_path_map[r["path"]] = r["sha"]
+		if r["type"] == "blob": remote_sha_map[r["sha"]] = true; remote_path_map[r["path"]] = r["sha"]
 	
-	var files_to_upload = []
-	var final_tree_items = []
-	var processed_local_paths = {}
-	var auto_msg_files = []
+	var files_to_upload = []; var final_tree_items = []; var processed_local_paths = {}; var auto_msg_files = []
 	var count = 0
-	
 	emit_signal("progress", "Хеширование", 0, local_files_paths.size())
 	
 	for path in local_files_paths:
-		count += 1
-		if count % 10 == 0: 
-			emit_signal("progress", "Хеширование", count, local_files_paths.size())
-			await get_tree().process_frame
-			
+		count += 1; if count % 10 == 0: emit_signal("progress", "Хеширование", count, local_files_paths.size()); await get_tree().process_frame
 		var local_sha = _calculate_git_sha(path)
 		var rel_path = path.replace("res://", "")
 		processed_local_paths[rel_path] = true
@@ -129,38 +216,27 @@ func _do_push_optimized(base_sha, local_files_paths: Array, message: String):
 			final_tree_items.append({ "path": rel_path, "mode": "100644", "type": "blob", "sha": local_sha })
 			if remote_path_map.get(rel_path) != local_sha: auto_msg_files.append(rel_path.get_file())
 		else:
-			files_to_upload.append({"path": path})
-			auto_msg_files.append(rel_path.get_file())
+			files_to_upload.append({"path": path}); auto_msg_files.append(rel_path.get_file())
 	
 	if not files_to_upload.is_empty():
 		_log("Загрузка %d новых файлов..." % files_to_upload.size(), Color.AQUA)
 		var uploaded = await _start_queue(files_to_upload, true)
 		if uploaded.size() != files_to_upload.size(): _finish(false, "Ошибка загрузки."); return
 		for u in uploaded: final_tree_items.append(u)
-	else:
-		_log("Дедупликация: загрузка не требуется.", Color.GREEN)
+	else: _log("Дедупликация: ОК.", Color.GREEN)
 
 	var deleted_count = 0
 	for old in old_remote_files:
-		var p = old["path"]
-		if old["type"] != "blob": continue
+		var p = old["path"]; if old["type"] != "blob": continue
 		if processed_local_paths.has(p): continue
-		
-		if FileAccess.file_exists("res://" + p):
-			final_tree_items.append({ "path": p, "mode": old["mode"], "type": "blob", "sha": old["sha"] })
-		else:
-			if not _is_ignored("res://" + p): deleted_count += 1
-			else: final_tree_items.append({ "path": p, "mode": old["mode"], "type": "blob", "sha": old["sha"] })
+		if FileAccess.file_exists("res://" + p): final_tree_items.append({ "path": p, "mode": old["mode"], "type": "blob", "sha": old["sha"] })
+		else: if not _is_ignored("res://" + p): deleted_count += 1
+		else: final_tree_items.append({ "path": p, "mode": old["mode"], "type": "blob", "sha": old["sha"] })
 
-	if auto_msg_files.is_empty() and deleted_count == 0:
-		_finish(true, "Нет изменений.")
-		return
-	
+	if auto_msg_files.is_empty() and deleted_count == 0: _finish(true, "Нет изменений."); return
 	if message.strip_edges() == "":
-		var f_names = ", ".join(auto_msg_files.slice(0, 3))
-		if auto_msg_files.size() > 3: f_names += " (+%d)" % (auto_msg_files.size() - 3)
-		message = "Upd: " + f_names
-		if deleted_count > 0: message += ", Del: %d" % deleted_count
+		var f_names = ", ".join(auto_msg_files.slice(0, 3)); if auto_msg_files.size() > 3: f_names += " (+%d)" % (auto_msg_files.size() - 3)
+		message = "Upd: " + f_names; if deleted_count > 0: message += ", Del: %d" % deleted_count
 
 	_log("Коммит: " + message, Color.AQUA)
 	var new_tree_sha = await _create_tree(final_tree_items)
@@ -171,23 +247,14 @@ func _do_push_optimized(base_sha, local_files_paths: Array, message: String):
 	if ok: last_known_sha = commit_sha; _finish(true, "Успех!")
 	else: _finish(false, "Конфликт.")
 
-# ==============================================================================
-# HASHING HELPER (ИСПРАВЛЕНО)
-# ==============================================================================
 func _calculate_git_sha(path: String) -> String:
 	var f = FileAccess.open(path, FileAccess.READ)
 	if not f: return ""
 	var content = f.get_buffer(f.get_length())
-	
-	# ИСПРАВЛЕНИЕ: Создаем заголовок без использования \0 в строке
 	var header_str = "blob " + str(content.size())
 	var header_bytes = header_str.to_utf8_buffer()
-	header_bytes.append(0) # Добавляем нулевой байт как байт, а не символ строки
-	
-	var ctx = HashingContext.new()
-	ctx.start(HashingContext.HASH_SHA1)
-	ctx.update(header_bytes)
-	ctx.update(content)
+	header_bytes.append(0)
+	var ctx = HashingContext.new(); ctx.start(HashingContext.HASH_SHA1); ctx.update(header_bytes); ctx.update(content)
 	return ctx.finish().hex_encode()
 
 # ==============================================================================
@@ -277,8 +344,12 @@ func _log(m, c): emit_signal("log_msg", m, c); print("[GitPro] ", m)
 func _finish(s, m): _log(m, Color.GREEN if s else Color.RED); emit_signal("operation_done", s)
 func _is_ignored(path: String) -> bool: return path.contains("/.godot/") or path.contains("/.git/") or path.ends_with(".uid") or path.ends_with(".bak")
 func _load_cfg():
-	var c = ConfigFile.new(); if c.load(USER_CFG)==OK: token=c.get_value("auth","token","").strip_edges()
-	if c.load(PROJ_CFG)==OK: owner_name=c.get_value("git","owner","").strip_edges(); repo_name=c.get_value("git","repo","").strip_edges()
+	var c = ConfigFile.new(); 
+	if c.load(USER_CFG)==OK: token=c.get_value("auth","token","").strip_edges()
+	# Грузим общий конфиг
+	if c.load(PROJ_CFG)==OK: 
+		owner_name=c.get_value("git","owner","vovawees").strip_edges()
+		repo_name=c.get_value("git","repo","GitProConnect").strip_edges()
+		
 func save_token(t): token=t.strip_edges(); var c=ConfigFile.new(); c.set_value("auth","token",token); c.save(USER_CFG); if token: _fetch_user()
-func save_proj(o,r): owner_name=o.strip_edges(); repo_name=r.strip_edges(); var c=ConfigFile.new(); c.set_value("git","owner",owner_name); c.set_value("git","repo",repo_name); c.save(PROJ_CFG)
 func get_magic_link(): return "https://github.com/settings/tokens/new?scopes=repo,user,workflow,gist&description=GodotGitPro_Client"
