@@ -6,7 +6,6 @@ var main_col: VBoxContainer
 var pages = {} 
 var ui_refs = {} 
 var icons = {}
-var is_dirty = false # Флаг изменений в файловой системе
 
 func _init(_core): core = _core
 
@@ -39,22 +38,17 @@ func _connect_signals():
 	)
 	core.state_changed.connect(_refresh_view)
 	core.remote_update_detected.connect(_on_remote_update)
-	
-	# АВТО-ОБНОВЛЕНИЕ СПИСКА ФАЙЛОВ
 	var fs = EditorInterface.get_resource_filesystem()
-	if not fs.filesystem_changed.is_connected(_on_fs_changed):
-		fs.filesystem_changed.connect(_on_fs_changed)
+	if not fs.filesystem_changed.is_connected(_on_fs_changed): fs.filesystem_changed.connect(_on_fs_changed)
 
 func _on_fs_changed():
-	# Если мы на странице файлов, обновляем дерево
-	if pages.has("files") and pages["files"].visible:
-		_refresh_file_list()
+	if pages.has("files") and pages["files"].visible: _refresh_file_list()
 
 func _on_remote_update():
 	if ui_refs.has("sync_btn"):
 		ui_refs.sync_btn.modulate = Color.GREEN
 		ui_refs.sync_btn.text = "ЕСТЬ ОБНОВЛЕНИЯ (ЖМИ)"
-		ui_refs.status.text = "Доступна новая версия на сервере!"
+		ui_refs.status.text = "Доступна новая версия!"
 
 func _create_layout():
 	for c in get_children(): c.queue_free()
@@ -64,7 +58,14 @@ func _create_layout():
 	# HEADER
 	var head = HBoxContainer.new()
 	var m = MarginContainer.new(); m.add_theme_constant_override("margin_left", 8); m.add_theme_constant_override("margin_top", 5); m.add_theme_constant_override("margin_right", 8); m.add_child(head); main_col.add_child(m)
-	ui_refs.avatar = TextureRect.new(); ui_refs.avatar.custom_minimum_size=Vector2(24,24); ui_refs.avatar.expand_mode=1; ui_refs.avatar.texture=icons.user
+	
+	# ИСПРАВЛЕНА АВАТАРКА
+	ui_refs.avatar = TextureRect.new()
+	ui_refs.avatar.custom_minimum_size=Vector2(24,24)
+	ui_refs.avatar.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	ui_refs.avatar.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	ui_refs.avatar.texture=icons.user
+	
 	ui_refs.username = Label.new(); ui_refs.username.text = "Гость"
 	var btn_cfg = Button.new(); btn_cfg.icon = icons.gear; btn_cfg.flat=true; btn_cfg.pressed.connect(func(): _set_page("settings"))
 	head.add_child(ui_refs.avatar); head.add_child(ui_refs.username); head.add_child(Control.new()); head.get_child(-1).size_flags_horizontal=3; head.add_child(btn_cfg); main_col.add_child(HSeparator.new())
@@ -81,7 +82,7 @@ func _create_layout():
 	var b_paste = Button.new(); b_paste.icon=icons.clip; b_paste.pressed.connect(func(): t_tok.text=DisplayServer.clipboard_get(); core.save_token(t_tok.text))
 	hb_tok.add_child(t_tok); hb_tok.add_child(b_paste)
 	var b_login = Button.new(); b_login.text="ВОЙТИ"; b_login.modulate=Color.GREEN; b_login.pressed.connect(func(): core.save_token(t_tok.text))
-	lb.add_child(Label.new()); lb.get_child(0).text="GitPro v4.0"; lb.get_child(0).horizontal_alignment=1; lb.add_child(b_get); lb.add_child(hb_tok); lb.add_child(b_login)
+	lb.add_child(Label.new()); lb.get_child(0).text="GitPro v4.1"; lb.get_child(0).horizontal_alignment=1; lb.add_child(b_get); lb.add_child(hb_tok); lb.add_child(b_login)
 	
 	# FILES
 	var p_files = VBoxContainer.new(); pages["files"]=p_files; body.add_child(p_files)
