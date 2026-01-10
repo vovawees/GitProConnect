@@ -3,12 +3,10 @@ extends EditorPlugin
 class_name GitProCore
 
 # --- КОНФИГ ---
-const VERSION = "7.2"
+const VERSION = "9.5" # Обновили версию
 const USER_CFG = "user://git_pro_auth.cfg"
 const PROJ_CFG = "res://addons/git_pro_connect/git_project_config.cfg"
-const CACHE_FILE = "user://git_pro_cache.dat"
 const SYNC_INTERVAL = 60.0
-const MAX_FILE_SIZE = 99 * 1024 * 1024 # 99 MB
 
 # --- ДАННЫЕ ---
 var token = ""
@@ -18,7 +16,6 @@ var branch = "main"
 var last_known_sha = ""
 var user_data = { "name": "Гость", "login": "", "avatar": null }
 var branches_list = []
-var file_cache = {} 
 var gitignore_rules = []
 
 # --- СИСТЕМА ---
@@ -32,11 +29,16 @@ signal progress(s: String, c: int, t: int)
 signal state_changed
 signal operation_done(ok: bool)
 signal remote_update_detected
-signal history_loaded(commits: Array)
+signal history_loaded(data: Array)
 signal branches_loaded(list: Array, current: String)
 signal blob_content_loaded(content: String)
+signal issues_loaded(list: Array)
+signal issue_created # Новый сигнал
+signal gists_loaded(list: Array)
+signal gist_content_loaded(filename: String, content: String) # Новый сигнал
 
 func _enter_tree():
+	# Создаем пул запросов
 	for i in range(4): 
 		var r = HTTPRequest.new()
 		r.timeout = 60.0
@@ -50,13 +52,12 @@ func _enter_tree():
 	sync_timer.timeout.connect(_check_remote)
 	add_child(sync_timer)
 	
-	_load_cache()
 	_load_cfg()
 	_load_gitignore()
 	
-	var ui_script = load("res://addons/git_pro_connect/git_ui.gd")
-	if ui_script: 
-		dock = ui_script.new(self)
+	var ui_res = load("res://addons/git_pro_connect/git_ui.gd")
+	if ui_res: 
+		dock = ui_res.new(self)
 		dock.name = "GitPro"
 		add_control_to_dock(DOCK_SLOT_RIGHT_BL, dock)
 	
@@ -67,31 +68,30 @@ func _enter_tree():
 		fetch_branches()
 
 func _exit_tree():
-	if dock:
+	if dock: 
 		remove_control_from_docks(dock)
 		dock.free()
 	for r in http_pool: r.queue_free()
-	_save_cache()
 
 # ==============================================================================
-# LOGIC
+# LOGIC (SYNC)
 # ==============================================================================
 func smart_sync(local_files: Array, message: String):
 	_log("Синхронизация...", Color.YELLOW)
 	
-	# Проверка на большие файлы
-	for p in local_files:
-		var f = FileAccess.open(p, FileAccess.READ)
-		if f and f.get_length() > MAX_FILE_SIZE:
-			_finish(false, "ОШИБКА: Файл > 100MB: " + p.get_file())
-			return
+	if local_files.is_empty():
+		_finish(false, "Не выбраны файлы!")
+		return
 
 	var remote_head = await _get_sha(branch)
 	if not remote_head: 
 		_finish(false, "Нет связи с GitHub.")
 		return
 
-	if last_known_sha != "" and remote_head != last_known_sha:
+	# Если локально мы не знаем SHA, считаем текущий удаленный актуальным
+	if last_known_sha == "": last_known_sha = remote_head
+
+	if remote_head != last_known_sha:
 		_log("Скачивание изменений...", Color.AQUA)
 		var ok = await _do_pull(remote_head)
 		if not ok: return
@@ -115,37 +115,21 @@ func _do_pull(head_sha) -> bool:
 	
 	for item in res:
 		var path = "res://" + item["path"]
-		var content = item["data"]
-		
-		if FileAccess.file_exists(path):
-			var existing = FileAccess.open(path, FileAccess.READ)
-			if existing.get_length() != content.size(): 
-				DirAccess.rename_absolute(path, path + ".bak")
-		
-		var dir = path.get_base_dir()
-		if not DirAccess.dir_exists_absolute(dir): 
-			DirAccess.make_dir_recursive_absolute(dir)
-			
-		var f = FileAccess.open(path, FileAccess.WRITE)
-		if f: 
-			f.store_buffer(content)
-			f.close()
-		_update_cache_entry(path, content)
+		_write_file_safe(path, item["data"])
 	
 	last_known_sha = head_sha
 	EditorInterface.get_resource_filesystem().scan()
 	return true
 
 func _do_push(base_sha, local_paths: Array, msg: String):
-	_log("Анализ...", Color.YELLOW)
+	_log("Анализ файлов...", Color.YELLOW)
 	
 	var old_tree_sha = await _get_commit_tree(base_sha)
 	var old_files = await _get_tree_recursive(old_tree_sha)
-	
 	var remote_map = {}
+	
 	for r in old_files: 
-		if r["type"] == "blob":
-			remote_map[r["sha"]] = true
+		if r["type"] == "blob": remote_map[r["sha"]] = true
 	
 	var to_upload = []
 	var final_tree = []
@@ -153,15 +137,15 @@ func _do_push(base_sha, local_paths: Array, msg: String):
 	var auto_msg = []
 	var c = 0
 	
-	emit_signal("progress", "Анализ", 0, local_paths.size())
+	emit_signal("progress", "Хеширование", 0, local_paths.size())
 	
 	for path in local_paths:
 		c += 1
-		if c % 20 == 0: 
-			emit_signal("progress", "Анализ", c, local_paths.size())
-			await get_tree().process_frame
-			
-		var sha = _get_sha_smart(path)
+		if c % 10 == 0: 
+			emit_signal("progress", "Хеширование", c, local_paths.size())
+			await get_tree().process_frame # Оптимизация UI
+		
+		var sha = _calculate_git_sha(path)
 		var rel = path.replace("res://", "")
 		processed[rel] = true
 		
@@ -177,20 +161,21 @@ func _do_push(base_sha, local_paths: Array, msg: String):
 		if uploaded.size() != to_upload.size(): 
 			_finish(false, "Ошибка загрузки.")
 			return
-		for u in uploaded: 
-			final_tree.append(u)
+		for u in uploaded: final_tree.append(u)
 	
 	var del_cnt = 0
 	for old in old_files:
 		var p = old["path"]
-		if old["type"] != "blob": continue
-		if processed.has(p): continue
+		if old["type"] != "blob" or processed.has(p): continue
 		
 		if FileAccess.file_exists("res://" + p):
+			# Файл существует локально, но не выбран для коммита - оставляем как есть
 			final_tree.append({ "path": p, "mode": old["mode"], "type": "blob", "sha": old["sha"] })
 		elif not _is_ignored("res://" + p):
+			# Файла нет локально и он не в игноре - значит удален
 			del_cnt += 1
 		else:
+			# Файл в игноре, оставляем
 			final_tree.append({ "path": p, "mode": old["mode"], "type": "blob", "sha": old["sha"] })
 
 	if to_upload.is_empty() and del_cnt == 0: 
@@ -202,14 +187,14 @@ func _do_push(base_sha, local_paths: Array, msg: String):
 		if auto_msg.size() > 2: msg += "..."
 		if del_cnt > 0: msg += ", Del: %d" % del_cnt
 
-	_log("Коммит...", Color.AQUA)
+	_log("Коммит: " + msg, Color.AQUA)
 	var new_tree = await _create_tree(final_tree)
 	if not new_tree: 
 		_finish(false, "Ошибка Tree.")
 		return
 	
 	var commit = await _create_commit(msg, new_tree, base_sha)
-	if !commit: 
+	if not commit: 
 		_finish(false, "Ошибка Commit.")
 		return
 	
@@ -220,135 +205,46 @@ func _do_push(base_sha, local_paths: Array, msg: String):
 		_finish(false, "Конфликт.")
 
 # ==============================================================================
-# BRANCHES
+# HASHING & IO
 # ==============================================================================
-func fetch_branches():
-	var r = await _api(0, "/git/refs/heads")
-	if r.c == 200:
-		branches_list.clear()
-		for item in r.d:
-			var b_name = item["ref"].replace("refs/heads/", "")
-			branches_list.append(b_name)
-		emit_signal("branches_loaded", branches_list, branch)
-
-func create_branch(new_name: String):
-	_log("Создание ветки " + new_name + "...", Color.YELLOW)
-	var sha = await _get_sha(branch)
-	if !sha: return
-	var r = await _api(HTTPClient.METHOD_POST, "/git/refs", { "ref": "refs/heads/"+new_name, "sha": sha })
-	if r.c == 201:
-		branch = new_name
-		fetch_branches()
-		_finish(true, "Ветка создана!")
-	else: 
-		_finish(false, "Ошибка создания ветки.")
-
-func fetch_history():
-	var r = await _api(0, "/git/commits?sha=" + branch + "&per_page=15")
-	if r.c == 200:
-		var clean = []
-		for c in r.d:
-			clean.append({
-				"msg": c["commit"]["message"],
-				"date": c["commit"]["author"]["date"].replace("T", " ").replace("Z", ""),
-				"author": c["commit"]["author"]["name"],
-				"sha": c["sha"]
-			})
-		emit_signal("history_loaded", clean)
-
-func fetch_blob_content(sha):
-	var r = await _api(0, "/git/blobs/" + sha)
-	if r.c == 200 and "content" in r.d:
-		var txt = Marshalls.base64_to_raw(r.d["content"]).get_string_from_utf8()
-		emit_signal("blob_content_loaded", txt)
-
-# ==============================================================================
-# CACHE
-# ==============================================================================
-func _load_cache():
-	if FileAccess.file_exists(CACHE_FILE):
-		var f = FileAccess.open(CACHE_FILE, FileAccess.READ)
-		if f: file_cache = f.get_var()
-	else: 
-		file_cache = {}
-
-func _save_cache():
-	var f = FileAccess.open(CACHE_FILE, FileAccess.WRITE)
-	if f: f.store_var(file_cache)
-
-func _get_sha_smart(path: String) -> String:
+func _calculate_git_sha(path: String) -> String:
 	var f = FileAccess.open(path, FileAccess.READ)
 	if not f: return ""
-	var mtime = FileAccess.get_modified_time(path)
-	
-	if file_cache.has(path):
-		var entry = file_cache[path]
-		if entry["mtime"] == mtime: return entry["sha"]
-	
 	var content = f.get_buffer(f.get_length())
-	var header = ("blob " + str(content.size())).to_utf8_buffer()
-	header.append(0)
-	
+	var header_str = "blob " + str(content.size())
+	var header_bytes = header_str.to_utf8_buffer()
+	header_bytes.append(0)
 	var ctx = HashingContext.new()
 	ctx.start(HashingContext.HASH_SHA1)
-	ctx.update(header)
+	ctx.update(header_bytes)
 	ctx.update(content)
-	var sha = ctx.finish().hex_encode()
-	
-	file_cache[path] = { "mtime": mtime, "sha": sha }
-	return sha
+	return ctx.finish().hex_encode()
 
-func _update_cache_entry(path, content_bytes):
-	var mtime = FileAccess.get_modified_time(path)
-	var header = ("blob " + str(content_bytes.size())).to_utf8_buffer()
-	header.append(0)
-	
-	var ctx = HashingContext.new()
-	ctx.start(HashingContext.HASH_SHA1)
-	ctx.update(header)
-	ctx.update(content_bytes)
-	file_cache[path] = { "mtime": mtime, "sha": ctx.finish().hex_encode() }
-
-func _load_gitignore():
-	gitignore_rules.clear()
-	var hard = [".godot/", ".git/", ".import/", "*.uid", "*.bak"]
-	for h in hard: gitignore_rules.append(h)
-	
-	if FileAccess.file_exists("res://.gitignore"):
-		var f = FileAccess.open("res://.gitignore", FileAccess.READ)
-		while not f.eof_reached():
-			var line = f.get_line().strip_edges()
-			if line != "" and not line.begins_with("#"):
-				gitignore_rules.append(line)
-
-func _is_ignored(path: String) -> bool:
-	var rel = path.replace("res://", "")
-	for rule in gitignore_rules:
-		if rule.ends_with("/"):
-			if rel.begins_with(rule) or rel.contains("/"+rule): return true
-		elif rule.begins_with("*."):
-			if rel.ends_with(rule.substr(1)): return true
-		elif rel == rule: 
-			return true
-	return false
+func _write_file_safe(path, content):
+	if FileAccess.file_exists(path):
+		var f = FileAccess.open(path, FileAccess.READ)
+		if f.get_length() != content.size(): 
+			DirAccess.rename_absolute(path, path + ".bak")
+	var dir = path.get_base_dir()
+	if !DirAccess.dir_exists_absolute(dir): 
+		DirAccess.make_dir_recursive_absolute(dir)
+	var f = FileAccess.open(path, FileAccess.WRITE)
+	if f: f.store_buffer(content)
 
 # ==============================================================================
-# API
+# API HELPER
 # ==============================================================================
 func _headers(): 
 	return ["Authorization: token " + token.strip_edges(), "Accept: application/vnd.github.v3+json", "Accept-Encoding: gzip", "User-Agent: GodotGitPro"]
 
-func _api(m, ep, d=null):
+func _api(m, ep, d=null, use_repo=true):
 	var h = HTTPRequest.new()
 	h.set_tls_options(TLSOptions.client_unsafe())
 	add_child(h)
-	
-	var url = "https://api.github.com/repos/%s/%s%s" % [owner_name.strip_edges(), repo_name.strip_edges(), ep]
-	h.request(url, _headers(), m, JSON.stringify(d) if d else "")
-	
+	var url_base = "https://api.github.com/repos/%s/%s" % [owner_name.strip_edges(), repo_name.strip_edges()] if use_repo else "https://api.github.com"
+	h.request(url_base + ep, _headers(), m, JSON.stringify(d) if d else "")
 	var r = await h.request_completed
 	h.queue_free()
-	
 	var json = JSON.parse_string(r[3].get_string_from_utf8())
 	return { "c": r[1], "d": json }
 
@@ -376,63 +272,160 @@ func _update_ref(b, s):
 	var r = await _api(HTTPClient.METHOD_PATCH, "/git/refs/heads/" + b, {"sha": s})
 	return r.c == 200
 
+# ==============================================================================
+# FEATURES
+# ==============================================================================
+func fetch_branches():
+	var r = await _api(0, "/git/refs/heads")
+	if r.c == 200:
+		branches_list.clear()
+		for item in r.d: 
+			branches_list.append(item["ref"].replace("refs/heads/", ""))
+		emit_signal("branches_loaded", branches_list, branch)
+
+func create_branch(n):
+	var s = await _get_sha(branch)
+	if !s: return
+	var r = await _api(HTTPClient.METHOD_POST, "/git/refs", {"ref":"refs/heads/"+n, "sha":s})
+	if r.c == 201:
+		branch = n
+		fetch_branches()
+		_finish(true, "Ветка создана!")
+	else:
+		_finish(false, "Ошибка создания.")
+
+func delete_branch(n):
+	if n == branch: 
+		_finish(false, "Нельзя удалить активную!")
+		return
+	var r = await _api(HTTPClient.METHOD_DELETE, "/git/refs/heads/"+n)
+	if r.c == 204: 
+		fetch_branches()
+		_finish(true, "Ветка удалена!")
+	else: 
+		_finish(false, "Ошибка удаления.")
+
+func fetch_history():
+	var r = await _api(0, "/git/commits?sha="+branch+"&per_page=15")
+	if r.c == 200:
+		var c = []
+		for i in r.d: 
+			c.append({"msg":i["commit"]["message"], "date":i["commit"]["author"]["date"].left(10), "author":i["commit"]["author"]["name"], "sha":i["sha"]})
+		emit_signal("history_loaded", c)
+
+# --- ISSUES ---
+func fetch_issues():
+	var r = await _api(0, "/issues?state=all&per_page=15&sort=updated")
+	if r.c == 200: emit_signal("issues_loaded", r.d)
+
+func create_issue_api(title, body):
+	if title == "": return
+	_log("Создание задачи...", Color.YELLOW)
+	var r = await _api(HTTPClient.METHOD_POST, "/issues", {"title": title, "body": body})
+	if r.c == 201:
+		_finish(true, "Задача создана!")
+		fetch_issues()
+		emit_signal("issue_created")
+	else:
+		_finish(false, "Ошибка создания задачи.")
+
+# --- GISTS ---
+func fetch_gists():
+	var r = await _api(0, "/gists", null, false) # use_repo=false
+	if r.c == 200:
+		emit_signal("gists_loaded", r.d)
+
+func create_gist_api(desc, filename, content, public=false):
+	if content == "": return
+	_log("Создание Gist...", Color.YELLOW)
+	var data = {
+		"description": desc,
+		"public": public,
+		"files": {
+			filename: { "content": content }
+		}
+	}
+	var r = await _api(HTTPClient.METHOD_POST, "/gists", data, false)
+	if r.c == 201:
+		_finish(true, "Gist создан!")
+		fetch_gists()
+	else:
+		_finish(false, "Ошибка создания Gist.")
+
+func get_gist_content(gist_id):
+	var r = await _api(0, "/gists/" + gist_id, null, false)
+	if r.c == 200:
+		var files = r.d.get("files", {})
+		if files.size() > 0:
+			var first_file = files.values()[0]
+			emit_signal("gist_content_loaded", first_file["filename"], first_file["content"])
+
+func fetch_blob_content(sha):
+	var r = await _api(0, "/git/blobs/" + sha)
+	if r.c == 200:
+		emit_signal("blob_content_loaded", Marshalls.base64_to_raw(r.d["content"]).get_string_from_utf8())
+
+# ==============================================================================
+# USER & CONFIG
+# ==============================================================================
 func _fetch_user():
-	var h = HTTPRequest.new()
-	h.set_tls_options(TLSOptions.client_unsafe())
-	add_child(h)
-	h.request("https://api.github.com/user", _headers(), 0)
-	
-	var r = await h.request_completed
-	h.queue_free()
-	
-	if r[1] == 200:
-		var d = JSON.parse_string(r[3].get_string_from_utf8())
-		if d:
-			user_data.login = d.get("login", "")
-			user_data.name = d.get("name", user_data.login)
-			if user_data.name == null: user_data.name = user_data.login
-			_load_avatar(d.get("avatar_url"))
-			call_deferred("emit_signal", "state_changed")
+	var r = await _api(0, "/user", null, false)
+	if r.c == 200:
+		user_data.login = r.d.get("login", "")
+		user_data.name = r.d.get("name", user_data.login)
+		_load_avatar(r.d.get("avatar_url"))
+		call_deferred("emit_signal", "state_changed")
 
 func _load_avatar(u):
-	if not u: return
+	if !u: return
 	var h = HTTPRequest.new()
 	h.set_tls_options(TLSOptions.client_unsafe())
 	add_child(h)
 	h.request(u)
-	
 	var r = await h.request_completed
 	h.queue_free()
-	
 	if r[1] == 200:
 		var i = Image.new()
-		if i.load_jpg_from_buffer(r[3]) != OK:
-			if i.load_png_from_buffer(r[3]) != OK:
-				i.load_webp_from_buffer(r[3])
+		if i.load_jpg_from_buffer(r[3]) != OK: 
+			if i.load_png_from_buffer(r[3]) != OK: i.load_webp_from_buffer(r[3])
 		user_data.avatar = ImageTexture.create_from_image(i)
 		emit_signal("state_changed")
 
 func _check_remote():
-	if not token or not repo_name: return
-	var sha = await _get_sha(branch)
-	if sha and last_known_sha and sha != last_known_sha:
+	if !token or !repo_name: return
+	var s = await _get_sha(branch)
+	if s and last_known_sha and s != last_known_sha: 
 		emit_signal("remote_update_detected")
 
 func _log(m, c): 
 	emit_signal("log_msg", m, c)
-	print("[GitPro] ", m)
+	if c == Color.RED: printerr("[GitPro] ", m)
+	else: print("[GitPro] ", m)
 
 func _finish(s, m): 
 	_log(m, Color.GREEN if s else Color.RED)
 	emit_signal("operation_done", s)
 
+func _load_gitignore():
+	gitignore_rules = [".godot/", ".git/", ".import/", "*.uid", "*.bak"]
+	if FileAccess.file_exists("res://.gitignore"):
+		var f = FileAccess.open("res://.gitignore", FileAccess.READ)
+		while not f.eof_reached():
+			var l = f.get_line().strip_edges()
+			if l != "" and not l.begins_with("#"): gitignore_rules.append(l)
+
+func _is_ignored(path):
+	var rel = path.replace("res://", "")
+	for r in gitignore_rules:
+		if (r.ends_with("/") and (rel.begins_with(r) or rel.contains("/"+r))) or (r.begins_with("*.") and rel.ends_with(r.substr(1))) or rel == r: return true
+	return false
+
 func _load_cfg():
 	var c = ConfigFile.new()
-	if c.load(USER_CFG) == OK:
-		token = c.get_value("auth", "token", "").strip_edges()
-	if c.load(PROJ_CFG) == OK:
-		owner_name = c.get_value("git", "owner", "vovawees").strip_edges()
-		repo_name = c.get_value("git", "repo", "GitProConnect").strip_edges()
+	if c.load(USER_CFG) == OK: token = c.get_value("auth", "token", "").strip_edges()
+	if c.load(PROJ_CFG) == OK: 
+		owner_name = c.get_value("git", "owner", "").strip_edges()
+		repo_name = c.get_value("git", "repo", "").strip_edges()
 
 func save_token(t): 
 	token = t.strip_edges()
@@ -449,11 +442,15 @@ func save_proj(o, r):
 	c.set_value("git", "repo", repo_name)
 	c.save(PROJ_CFG)
 
-func get_magic_link():
-	return "https://github.com/settings/tokens/new?scopes=repo,user,workflow,gist&description=GodotGitPro_Client"
+func get_magic_link(): 
+	return "https://github.com/settings/tokens/new?scopes=repo,user,gist&description=GodotGitPro_Client"
 
 # --- QUEUE ---
-var _q_items = []; var _q_res = []; var _q_act = 0; var _q_tot = 0; var _q_up = false
+var _q_items = []
+var _q_res = []
+var _q_act = 0
+var _q_tot = 0
+var _q_up = false
 signal _q_done
 
 func _start_queue(i, u) -> Array:
@@ -487,12 +484,13 @@ func _run_w(i, item):
 	var url = "https://api.github.com/repos/%s/%s/git/blobs" % [owner_name, repo_name]
 	var err = OK
 	
-	if _q_up: 
+	if _q_up:
 		var f = FileAccess.open(item["path"], FileAccess.READ)
 		if f:
 			var b64 = Marshalls.raw_to_base64(f.get_buffer(f.get_length()))
 			err = req.request(url, _headers(), HTTPClient.METHOD_POST, JSON.stringify({"content": b64, "encoding": "base64"}))
-		else: err = FAILED
+		else:
+			err = FAILED
 	else:
 		url += "/" + item["sha"]
 		err = req.request(url, _headers(), HTTPClient.METHOD_GET)
@@ -509,6 +507,7 @@ func _run_w(i, item):
 		return
 	
 	var r = await req.request_completed
+	
 	if r[1] in [200, 201]:
 		var j = JSON.parse_string(r[3].get_string_from_utf8())
 		if j:
