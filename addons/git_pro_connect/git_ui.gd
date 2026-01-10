@@ -7,11 +7,17 @@ var pages = {}
 var ui_refs = {} 
 var icons = {}
 
+# Diff Window
+var diff_dialog: AcceptDialog
+var diff_local: CodeEdit
+var diff_remote: CodeEdit
+
 func _init(_core): core = _core
 
 func _ready():
 	_load_icons()
 	_create_layout()
+	_setup_diff_window()
 	_connect_signals()
 	await get_tree().process_frame
 	_refresh_view()
@@ -24,7 +30,7 @@ func _load_icons():
 		"scene": g.call("PackedScene"), "reload": g.call("Reload"), "gear": g.call("Tools"),
 		"user": g.call("Skeleton2D"), "save": g.call("Save"), "down": g.call("MoveDown"), 
 		"lock": g.call("CryptoKey"), "clip": g.call("ActionCopy"), "sync": g.call("AssetLib"),
-		"update": g.call("AssetLib")
+		"branch": g.call("GraphNode")
 	}
 
 func _connect_signals():
@@ -33,14 +39,15 @@ func _connect_signals():
 	core.progress.connect(func(s, c, t): if ui_refs.has("sync_btn"): ui_refs.sync_btn.text = "%s (%d/%d)" % [s, c, t]; ui_refs.sync_btn.disabled=true)
 	core.operation_done.connect(func(s): 
 		if ui_refs.has("sync_btn"):
-			ui_refs.sync_btn.disabled=false; ui_refs.sync_btn.text="СИНХРОНИЗИРОВАТЬ"
-			ui_refs.sync_btn.modulate = Color.WHITE
-			ui_refs.comment.text = ""
-			_refresh_file_list()
+			ui_refs.sync_btn.disabled=false; ui_refs.sync_btn.text="СИНХРОНИЗИРОВАТЬ"; ui_refs.sync_btn.modulate = Color.WHITE
+			ui_refs.comment.text = ""; _refresh_file_list()
 	)
 	core.state_changed.connect(_refresh_view)
 	core.remote_update_detected.connect(_on_remote_update)
-	core.plugin_update_available.connect(_on_plugin_update_available)
+	core.branches_loaded.connect(_update_branches)
+	core.history_loaded.connect(_update_history)
+	core.blob_content_loaded.connect(_show_diff_remote)
+	
 	var fs = EditorInterface.get_resource_filesystem()
 	if not fs.filesystem_changed.is_connected(_on_fs_changed): fs.filesystem_changed.connect(_on_fs_changed)
 
@@ -48,14 +55,7 @@ func _on_fs_changed():
 	if pages.has("files") and pages["files"].visible: _refresh_file_list()
 
 func _on_remote_update():
-	if ui_refs.has("sync_btn"):
-		ui_refs.sync_btn.modulate = Color.GREEN
-		ui_refs.sync_btn.text = "СЕРВЕР ОБНОВИЛСЯ (ЖМИ)"
-
-func _on_plugin_update_available(v):
-	if ui_refs.has("update_btn"):
-		ui_refs.update_btn.visible = true
-		ui_refs.update_btn.text = "ДОСТУПНО ОБНОВЛЕНИЕ v%s" % v
+	if ui_refs.has("sync_btn"): ui_refs.sync_btn.modulate = Color.GREEN; ui_refs.sync_btn.text = "СЕРВЕР ОБНОВИЛСЯ!"
 
 func _create_layout():
 	for c in get_children(): c.queue_free()
@@ -67,26 +67,19 @@ func _create_layout():
 	var m = MarginContainer.new(); m.add_theme_constant_override("margin_left", 8); m.add_theme_constant_override("margin_top", 5); m.add_theme_constant_override("margin_right", 8); m.add_child(head); main_col.add_child(m)
 	ui_refs.avatar = TextureRect.new(); ui_refs.avatar.custom_minimum_size=Vector2(24,24); ui_refs.avatar.expand_mode=1; ui_refs.avatar.stretch_mode=5; ui_refs.avatar.texture=icons.user
 	ui_refs.username = Label.new(); ui_refs.username.text = "Гость"
-	var btn_cfg = Button.new(); btn_cfg.icon = icons.gear; btn_cfg.flat=true; btn_cfg.pressed.connect(func(): _set_page("settings"))
 	
-	# КНОПКА ОБНОВЛЕНИЯ ПЛАГИНА (СКРЫТА ПО УМОЛЧАНИЮ)
-	ui_refs.update_btn = Button.new()
-	ui_refs.update_btn.text = "UPDATE"
-	ui_refs.update_btn.icon = icons.update
-	ui_refs.update_btn.visible = false
-	ui_refs.update_btn.modulate = Color(1, 1, 0) # Желтый
-	ui_refs.update_btn.pressed.connect(func(): core.install_plugin_update())
-
-	head.add_child(ui_refs.avatar); head.add_child(ui_refs.username); 
-	head.add_child(Control.new()); head.get_child(-1).size_flags_horizontal=3; 
-	head.add_child(ui_refs.update_btn); # Добавляем кнопку обновления
-	head.add_child(btn_cfg); 
-	main_col.add_child(HSeparator.new())
+	ui_refs.branch_opt = OptionButton.new()
+	ui_refs.branch_opt.item_selected.connect(_on_branch_select)
+	
+	var btn_cfg = Button.new(); btn_cfg.icon = icons.gear; btn_cfg.flat=true; btn_cfg.pressed.connect(func(): _set_page("settings"))
+	head.add_child(ui_refs.avatar); head.add_child(ui_refs.username); head.add_child(VSeparator.new())
+	head.add_child(ui_refs.branch_opt)
+	head.add_child(Control.new()); head.get_child(-1).size_flags_horizontal=3; head.add_child(btn_cfg); main_col.add_child(HSeparator.new())
 
 	# BODY
 	var body = PanelContainer.new(); body.size_flags_vertical=3; main_col.add_child(body)
 	
-	# LOGIN
+	# PAGE: LOGIN
 	var p_login = CenterContainer.new(); pages["login"]=p_login; body.add_child(p_login)
 	var lb = VBoxContainer.new(); lb.custom_minimum_size.x = 250; p_login.add_child(lb)
 	var b_get = Button.new(); b_get.text="1. Получить токен"; b_get.icon=icons.lock; b_get.pressed.connect(func(): OS.shell_open(core.get_magic_link()))
@@ -95,51 +88,56 @@ func _create_layout():
 	var b_paste = Button.new(); b_paste.icon=icons.clip; b_paste.pressed.connect(func(): t_tok.text=DisplayServer.clipboard_get(); core.save_token(t_tok.text))
 	hb_tok.add_child(t_tok); hb_tok.add_child(b_paste)
 	var b_login = Button.new(); b_login.text="ВОЙТИ"; b_login.modulate=Color.GREEN; b_login.pressed.connect(func(): core.save_token(t_tok.text))
-	lb.add_child(Label.new()); lb.get_child(0).text="GitPro v6.0"; lb.get_child(0).horizontal_alignment=1; lb.add_child(b_get); lb.add_child(hb_tok); lb.add_child(b_login)
+	lb.add_child(Label.new()); lb.get_child(0).text="GitPro v7.2"; lb.get_child(0).horizontal_alignment=1; lb.add_child(b_get); lb.add_child(hb_tok); lb.add_child(b_login)
 	
-	# FILES
-	var p_files = VBoxContainer.new(); pages["files"]=p_files; body.add_child(p_files)
+	# PAGE: MAIN (TABS)
+	var p_main = TabContainer.new(); pages["files"]=p_main; body.add_child(p_main)
+	
+	var tab_files = VBoxContainer.new(); tab_files.name = "Файлы"; p_main.add_child(tab_files)
 	ui_refs.tree = Tree.new(); ui_refs.tree.size_flags_vertical=3; ui_refs.tree.hide_root=true; ui_refs.tree.columns=2; ui_refs.tree.set_column_expand(0, false); ui_refs.tree.set_column_custom_minimum_width(0, 30)
-	p_files.add_child(ui_refs.tree)
+	ui_refs.tree.item_activated.connect(_on_file_double_click)
+	tab_files.add_child(ui_refs.tree)
 	
-	# SETTINGS
+	var tab_hist = VBoxContainer.new(); tab_hist.name = "История"; p_main.add_child(tab_hist)
+	var b_refresh_hist = Button.new(); b_refresh_hist.text="Обновить"; b_refresh_hist.pressed.connect(func(): core.fetch_history())
+	tab_hist.add_child(b_refresh_hist)
+	ui_refs.hist_list = ItemList.new(); ui_refs.hist_list.size_flags_vertical=3
+	tab_hist.add_child(ui_refs.hist_list)
+
+	# PAGE: SETTINGS
 	var p_set = VBoxContainer.new(); pages["settings"]=p_set; body.add_child(p_set)
 	ui_refs.inp_owner = LineEdit.new(); ui_refs.inp_owner.placeholder_text="Owner"
 	ui_refs.inp_repo = LineEdit.new(); ui_refs.inp_repo.placeholder_text="Repo"
-	var b_sv = Button.new(); b_sv.text="Сохранить общий конфиг"; b_sv.pressed.connect(func(): core.save_proj(ui_refs.inp_owner.text, ui_refs.inp_repo.text); _refresh_view())
+	var b_sv = Button.new(); b_sv.text="Сохранить"; b_sv.pressed.connect(func(): core.save_proj(ui_refs.inp_owner.text, ui_refs.inp_repo.text); _refresh_view())
 	var b_bk = Button.new(); b_bk.text="Назад"; b_bk.pressed.connect(func(): _set_page("files"))
 	var b_out = Button.new(); b_out.text="Выход"; b_out.modulate=Color.RED; b_out.pressed.connect(func(): core.save_token(""); _refresh_view())
-	p_set.add_child(Label.new()); p_set.get_child(0).text="Общие настройки (vovawees/GitProConnect)"; p_set.add_child(ui_refs.inp_owner); p_set.add_child(ui_refs.inp_repo); p_set.add_child(b_sv); p_set.add_child(b_out); p_set.add_child(b_bk)
+	p_set.add_child(Label.new()); p_set.get_child(0).text="Настройки"; p_set.add_child(ui_refs.inp_owner); p_set.add_child(ui_refs.inp_repo); p_set.add_child(b_sv); p_set.add_child(b_out); p_set.add_child(b_bk)
 
 	# FOOTER
 	var foot = VBoxContainer.new(); var fm = MarginContainer.new(); fm.add_theme_constant_override("margin_left",5); fm.add_theme_constant_override("margin_right",5); fm.add_theme_constant_override("margin_bottom",5); fm.add_child(foot); main_col.add_child(fm)
-	ui_refs.comment = LineEdit.new(); ui_refs.comment.placeholder_text="Авто-комментарий..."
+	ui_refs.comment = LineEdit.new(); ui_refs.comment.placeholder_text="Комментарий..."
 	foot.add_child(ui_refs.comment)
-	
-	ui_refs.sync_btn = Button.new()
-	ui_refs.sync_btn.text = "СИНХРОНИЗИРОВАТЬ"
-	ui_refs.sync_btn.icon = icons.sync
-	ui_refs.sync_btn.custom_minimum_size.y = 35
-	ui_refs.sync_btn.pressed.connect(_on_sync_click)
-	foot.add_child(ui_refs.sync_btn)
-	
-	ui_refs.status = Label.new(); ui_refs.status.text="Готов к работе"; ui_refs.status.modulate=Color.GRAY
-	foot.add_child(ui_refs.status)
+	ui_refs.sync_btn = Button.new(); ui_refs.sync_btn.text = "СИНХРОНИЗИРОВАТЬ"; ui_refs.sync_btn.icon = icons.sync; ui_refs.sync_btn.custom_minimum_size.y = 35; ui_refs.sync_btn.pressed.connect(_on_sync_click); foot.add_child(ui_refs.sync_btn)
+	ui_refs.status = Label.new(); ui_refs.status.text="Готов"; ui_refs.status.modulate=Color.GRAY; foot.add_child(ui_refs.status)
+
+func _setup_diff_window():
+	diff_dialog = AcceptDialog.new(); diff_dialog.title = "Просмотр кода"; diff_dialog.size = Vector2(800, 500)
+	var split = HBoxContainer.new(); split.size_flags_vertical=3; diff_dialog.add_child(split)
+	diff_local = CodeEdit.new(); diff_local.size_flags_horizontal=3; diff_local.placeholder_text="ЛОКАЛЬНО"
+	diff_remote = CodeEdit.new(); diff_remote.size_flags_horizontal=3; diff_remote.placeholder_text="СЕРВЕР (Загрузка...)"
+	split.add_child(diff_remote); split.add_child(diff_local)
+	add_child(diff_dialog)
 
 func _refresh_view():
 	if not core: return
 	if core.token == "": _set_page("login")
-	# Теперь репо проверяется по-другому, так как он дефолтный
 	elif core.repo_name == "": ui_refs.inp_owner.text = core.owner_name; ui_refs.inp_repo.text = core.repo_name; _set_page("settings")
 	else:
 		if core.user_data.get("name"): ui_refs.username.text = core.user_data.name
 		else: ui_refs.username.text = core.user_data.get("login", "Гость")
 		if core.user_data.get("avatar"): ui_refs.avatar.texture = core.user_data.avatar
-		
-		# Заполняем настройки текущими значениями (они теперь общие)
-		ui_refs.inp_owner.text = core.owner_name
-		ui_refs.inp_repo.text = core.repo_name
-		
+		core.fetch_branches()
+		core.fetch_history()
 		_set_page("files")
 
 func _set_page(n):
@@ -183,3 +181,46 @@ func _get_checked(it, list):
 	if not it: return
 	if it.get_cell_mode(0) == TreeItem.CELL_MODE_CHECK and it.is_checked(0): list.append(it.get_metadata(0))
 	var ch = it.get_first_child(); while ch: _get_checked(ch, list); ch = ch.get_next()
+
+# --- BRANCHES ---
+func _update_branches(list, cur):
+	if !ui_refs.has("branch_opt"): return
+	ui_refs.branch_opt.clear()
+	var idx = 0
+	for b in list:
+		ui_refs.branch_opt.add_item(b)
+		if b == cur: ui_refs.branch_opt.select(idx)
+		idx += 1
+	ui_refs.branch_opt.add_separator(); ui_refs.branch_opt.add_item("+ Новая ветка")
+
+func _on_branch_select(idx):
+	var txt = ui_refs.branch_opt.get_item_text(idx)
+	if txt == "+ Новая ветка":
+		var dlg = ConfirmationDialog.new(); dlg.title="Новая ветка"; var l=LineEdit.new(); dlg.add_child(l); add_child(dlg); dlg.popup_centered(Vector2(200,80)); dlg.confirmed.connect(func(): core.create_branch(l.text))
+	else:
+		core.branch = txt; core.last_known_sha = ""; core.fetch_history(); _refresh_file_list()
+
+# --- HISTORY ---
+func _update_history(commits):
+	if !ui_refs.has("hist_list"): return
+	ui_refs.hist_list.clear()
+	for c in commits:
+		ui_refs.hist_list.add_item(c["date"] + ": " + c["msg"] + " (" + c["author"] + ")")
+
+# --- DIFF ---
+func _on_file_double_click():
+	var it = ui_refs.tree.get_selected()
+	if not it or it.get_metadata(0) == null: return
+	var path = it.get_metadata(0)
+	var f = FileAccess.open(path, FileAccess.READ)
+	if f: diff_local.text = f.get_as_text()
+	else: diff_local.text = "(Не удалось прочитать файл)"
+	
+	diff_remote.text = "Загрузка с сервера..."
+	diff_dialog.popup_centered()
+	
+	var sha = core._get_sha_smart(path)
+	core.fetch_blob_content(sha)
+
+func _show_diff_remote(content):
+	if diff_remote: diff_remote.text = content
